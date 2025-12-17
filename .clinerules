@@ -1,0 +1,9 @@
+# Project Rules
+
+1. **Language:** You must ALWAYS think and respond in **Korean (한국어)**.
+   - Even if the user asks in English, translate your thought process and answer into Korean.
+   - Code comments should be in English, but explanations must be in Korean.
+
+2. **Reference:** Always check `architecture.md` for the folder structure and `implementation_plan.md` for the step-by-step tasks.
+
+3. **Context:** We are building an Elastic Visual Search Comparison tool using Python and Agent Builder.

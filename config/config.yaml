@@ -1,0 +1,2 @@
+visual_model: "jinaai/jina-embeddings-v4"
+token_pooling_ratio: 0.3

@@ -1,0 +1,22 @@
+[Reference Documents for Implementation]
+
+1. Target Platform: Elastic Cloud Serverless (Always Latest Version)
+   - Do NOT pin specific versions (e.g., 9.0). Use the latest compatible client.
+
+2. Core Feature: Elastic Agent Builder & MCP
+   - We are building a custom MCP server to connect with Elastic Agent Builder.
+   - Reference for MCP Protocol in Elastic: https://github.com/elastic/mcp-server-elasticsearch (Base repository to fork)
+   - Documentation: (Attached PDF: Elasticsearch - Agent Builder FAQs for Sales.pdf) - Focus on MCP and A2A integration sections.
+
+3. Visual Search & Rank Vectors (ColPali/Jina v4)
+   - We need to implement 'rank_vectors' for late-interaction models.
+   - Reference logic for Token Pooling: https://www.elastic.co/search-labs/blog/late-interaction-model-colpali-scale
+   - Code Reference: https://github.com/elastic/elasticsearch-labs/blob/main/supporting-blog-content/colpali/04_token_pooling.ipynb
+
+4. Logic Reference (Morphik)
+   - Ingestion Logic (Core): https://github.com/morphik-org/morphik-core
+   - MCP Tool Definitions: https://github.com/morphik-org/morphik-mcp (Reference for tool signatures, but we build for Elastic backend)
+
+5. Models
+   - Main Model: jinaai/jina-embeddings-v4 (Supports both Visual & Text modes)
+   - Benchmark verification: https://huggingface.co/spaces/mteb/leaderboard (Vidore v3)

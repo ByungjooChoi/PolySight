@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "polysight"
+version = "1.0.0"
+description = "Enterprise Document Intelligence: Comparing OCR vs. Vision Language Models (VLM)"
+license = "Apache-2.0"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "backend"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+elasticsearch = "^8.12.0"
+python-dotenv = "^1.0.0"
+pyyaml = "^6.0"
+pydantic = "^2.5.0"
+mcp = "*"
+torch = ">=2.0.0"
+transformers = "^4.36.0"
+pillow = "^10.0.0"
+pypdfium2 = "^4.24.0"
+aiohttp = "^3.13.0"
+streamlit = "^1.30.0"
+starlette = "^0.50.0"
+uvicorn = "^0.38.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
