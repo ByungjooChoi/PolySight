@@ -41,3 +41,9 @@ MANIFEST
 # Elastic / Project specific
 data/
 logs/
+temp/
+hf_cache/
+
+# AI Rules
+.clinerules
+.roorules

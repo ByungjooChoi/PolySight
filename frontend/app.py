@@ -1,15 +1,25 @@
 import sys
 import os
 import asyncio
+import uuid
 import streamlit as st
 from dotenv import load_dotenv
 
+# Set Hugging Face Cache to project directory to avoid Windows path limit
+# This must be done before importing transformers or backend modules that use it
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+hf_cache_dir = os.path.join(project_root, "hf_cache")
+os.environ["HF_HOME"] = hf_cache_dir
+if not os.path.exists(hf_cache_dir):
+    try:
+        os.makedirs(hf_cache_dir, exist_ok=True)
+    except Exception:
+        pass
+
 # Add project root to path to verify backend imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.append(project_root)
 
 # Import backend modules
-# We import inside a try-except block to handle path issues gracefully if needed, 
-# but sys.path.append above should resolve it.
 from backend.pipelines.ingestion import IngestionManager
 
 # --- Setup ---
@@ -21,12 +31,10 @@ if not os.path.exists("temp"):
     os.makedirs("temp")
 
 # Windows Asyncio Policy fix
-# Only apply on Windows
 if sys.platform.startswith('win'):
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     except AttributeError:
-        # Some older python versions or environments might not have this
         pass
 
 # --- Sidebar: Configuration ---
@@ -41,13 +49,12 @@ with st.sidebar:
     jina_key = st.text_input("Jina API Key", value=os.getenv("JINA_API_KEY", ""), type="password")
     
     st.subheader("Visual Settings")
-    token_ratio = st.slider("Token Pooling Ratio", 0.1, 1.0, 0.3, help="Lower ratio = smaller index size (Not yet fully wired to backend)")
+    token_ratio = st.slider("Token Pooling Ratio", 0.1, 1.0, 0.3, help="Lower ratio = smaller index size")
     
     st.subheader("Text Settings")
     ocr_provider = st.selectbox("OCR Provider", ["jina", "reducto", "unstructured"])
     
     if st.button("Save & Apply Config"):
-        # Update Environment Variables
         os.environ["ELASTIC_CLOUD_SERVERLESS_URL"] = elastic_url
         os.environ["ELASTIC_API_KEY"] = elastic_key
         os.environ["JINA_API_KEY"] = jina_key
@@ -59,64 +66,80 @@ with st.sidebar:
 
 # --- Main Page ---
 st.title("Elastic PDF Visual Search Comparison")
-st.markdown("Upload a PDF to process it through **Visual Search (VLM)** and **Text Search (OCR)** pipelines.")
+st.markdown("Upload PDFs to process them through **Visual Search (VLM)** and **Text Search (OCR)** pipelines.")
 
-uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
+# Enable multiple files
+uploaded_files = st.file_uploader("Choose PDF file(s)", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_file and st.button("Run Ingestion & Indexing"):
-    file_path = os.path.join("temp", uploaded_file.name)
+if uploaded_files and st.button("Run Ingestion & Indexing"):
+    # Ensure list
+    if not isinstance(uploaded_files, list):
+        uploaded_files = [uploaded_files]
+        
+    total_files = len(uploaded_files)
+    st.info(f"Starting ingestion for {total_files} file(s)...")
     
-    # Save file
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    
-    st.info(f"Processing {uploaded_file.name}...")
-    
-    progress_bar = st.progress(0)
+    overall_progress = st.progress(0)
     status_text = st.empty()
+    success_count = 0
     
+    # Initialize Pipelines
     try:
-        status_text.text("Initializing pipelines...")
-        progress_bar.progress(10)
-        
-        # Ensure IngestionManager is initialized (or re-initialized)
-        # This will trigger model loading if not already loaded
+        status_text.text("Initializing pipelines (loading models)...")
         manager = IngestionManager()
-        
-        status_text.text("Running pipelines (this may take a while)...")
-        progress_bar.progress(30)
-        
-        # Run async process
-        # On Streamlit, we need to run the async loop carefully.
-        # process_pdf is an async method.
-        stats = asyncio.run(manager.process_pdf(file_path))
-        
-        progress_bar.progress(100)
-        status_text.text("Processing Complete!")
-        
-        if stats:
-            st.success("Ingestion Completed Successfully!")
-            
-            # Display Stats
-            st.markdown("### Ingestion Statistics")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Visual Pages Indexed", stats.get("visual_count", 0))
-            col2.metric("Text Chunks Indexed", stats.get("text_count", 0))
-            col3.metric("Total Documents", stats.get("total_indexed", 0))
-            
-            st.json(stats) # Raw stats for debugging
-            
-        else:
-            st.warning("Process completed but no data returned (Check logs).")
-            
     except Exception as e:
-        st.error(f"An error occurred: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-    finally:
-        # Optional: Cleanup temp file
-        # os.remove(file_path)
-        pass
+        st.error(f"Failed to initialize pipelines: {e}")
+        st.stop()
+
+    # Process Loop
+    for i, uploaded_file in enumerate(uploaded_files):
+        current_idx = i + 1
+        status_text.text(f"Processing file {current_idx}/{total_files}: {uploaded_file.name}...")
+        
+        try:
+            # Generate safe filename
+            file_ext = os.path.splitext(uploaded_file.name)[1]
+            if not file_ext:
+                file_ext = ".pdf"
+            safe_filename = f"{uuid.uuid4()}{file_ext}"
+            file_path = os.path.join("temp", safe_filename)
+            
+            # Save file locally
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            # Run Pipeline
+            # process_pdf is async
+            stats = asyncio.run(manager.process_pdf(file_path))
+            
+            if stats:
+                success_count += 1
+                with st.expander(f"✅ {uploaded_file.name} (Visual: {stats.get('visual_count')}, Text: {stats.get('text_count')})", expanded=False):
+                    st.json(stats)
+            else:
+                st.warning(f"⚠️ {uploaded_file.name} processed but returned no data.")
+                
+        except Exception as e:
+            st.error(f"❌ Error processing {uploaded_file.name}: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+        finally:
+            # Cleanup temp file
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+
+        # Update Progress
+        overall_progress.progress(current_idx / total_files)
+
+    # Final Status
+    status_text.text("Ingestion Complete!")
+    if success_count == total_files:
+        st.success(f"All {total_files} files processed successfully!")
+    else:
+        st.warning(f"Completed with issues. {success_count}/{total_files} files successful.")
 
 # --- Footer ---
 st.markdown("---")
