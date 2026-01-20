@@ -47,3 +47,6 @@ hf_cache/
 # AI Rules
 .clinerules
 .roorules
+
+# Deployment Scripts
+deploy.py
