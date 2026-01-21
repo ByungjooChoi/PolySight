@@ -529,8 +529,8 @@ def check_vidore_loaded() -> Tuple[bool, int]:
 
 def load_vidore_samples(num_samples: int = 20, progress=gr.Progress()) -> str:
     """
-    Load ViDoRe benchmark samples into the index.
-    Checks for duplicates before loading.
+    Load ViDoRe benchmark samples into the index using streaming.
+    No local download - streams directly from HuggingFace to Elasticsearch.
     """
     # Check environment first
     is_valid, error_msg = validate_environment_for_action("ViDoRe 샘플 로드")
@@ -543,33 +543,44 @@ def load_vidore_samples(num_samples: int = 20, progress=gr.Progress()) -> str:
         return f"⚠️ ViDoRe 샘플이 이미 로드되어 있습니다! (현재 {existing_count}개 문서)\n\n다시 로드하려면 먼저 'Settings' 탭에서 인덱스를 초기화하세요."
 
     try:
-        progress(0.1, desc="ViDoRe 데이터셋 로딩 중...")
-        loader = ViDoReLoader()
-        samples = loader.get_samples("test", num_samples)
+        from datasets import load_dataset
 
-        if not samples:
-            return "❌ ViDoRe 샘플을 가져올 수 없습니다."
+        progress(0.1, desc="HuggingFace 스트리밍 연결 중...")
+
+        # Stream directly from HuggingFace (no local download)
+        dataset = load_dataset(
+            "vidore/docvqa_test_subsampled",
+            split="test",
+            streaming=True,
+            trust_remote_code=True
+        )
 
         manager = get_ingestion_manager()
         success_count = 0
-        total = len(samples)
+        sample_queries = []
 
-        for i, sample in enumerate(samples):
-            progress((i + 1) / total * 0.9 + 0.1, desc=f"인덱싱 중... {i+1}/{total}")
+        # Stream and process each sample
+        for i, sample in enumerate(dataset.take(num_samples)):
+            progress((i + 1) / num_samples * 0.9 + 0.1, desc=f"스트리밍 & 인덱싱 중... {i+1}/{num_samples}")
 
             image = sample.get("image")
             if image is None:
                 continue
 
+            # Collect sample queries
+            query = sample.get("query", "")
+            if query and len(sample_queries) < 5:
+                sample_queries.append(query)
+
             try:
                 # Create unique doc_id with vidore prefix
-                doc_id = f"vidore_{sample.get('doc_id', f'doc_{i}')}_{sample.get('page_id', 0)}"
+                doc_id = f"vidore_{sample.get('docId', f'doc_{i}')}_{sample.get('page', 0)}"
 
-                # Process through both pipelines
+                # Process through both pipelines (HuggingFace → Elasticsearch directly)
                 asyncio.run(manager.process_image(
                     image=image,
                     doc_id=doc_id,
-                    page_number=sample.get("page_id", 0),
+                    page_number=sample.get("page", 0),
                     file_name=f"vidore_sample_{i}.png"
                 ))
                 success_count += 1
@@ -577,19 +588,23 @@ def load_vidore_samples(num_samples: int = 20, progress=gr.Progress()) -> str:
             except Exception as e:
                 logger.error(f"Failed to process sample {i}: {e}")
 
-        # Get sample queries for user
-        sample_queries = loader.get_queries("test")[:5]
+        # Format sample queries collected during streaming
+        if not sample_queries:
+            sample_queries = ["What is the total amount?", "Find the date", "Who signed this document?"]
         queries_text = "\n".join([f"  • {q}" for q in sample_queries])
 
-        return f"""✅ ViDoRe 샘플 로드 완료!
+        return f"""✅ ViDoRe 샘플 스트리밍 & 인덱싱 완료!
 
-**결과:** {success_count}/{total} 샘플 인덱싱 성공
+**결과:** {success_count}/{num_samples} 샘플 인덱싱 성공
+**방식:** HuggingFace → Elasticsearch 직접 스트리밍 (로컬 저장 없음)
 
 **검색 예시 쿼리:**
 {queries_text}
 
 Search Battle 탭에서 위 쿼리로 검색해보세요!"""
 
+    except ImportError:
+        return "❌ datasets 라이브러리가 필요합니다. `pip install datasets` 실행하세요."
     except Exception as e:
         return f"❌ 에러 발생: {str(e)}"
 
