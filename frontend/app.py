@@ -37,10 +37,11 @@ def check_environment() -> dict:
     Returns:
         dict with status of each required setting
     """
-    # Try to get config (may not be loaded yet at import time)
+    # Try to get config (reload to get latest values)
     try:
         from backend.utils.config_manager import get_config
         config = get_config()
+        config.reload()  # Force reload to get latest config.json
         config_elastic_url = config.elastic_url
         config_elastic_api_key = config.elastic_api_key
         config_hf_token = config.hf_token
@@ -168,11 +169,7 @@ def validate_environment_for_action(action_name: str) -> tuple[bool, str]:
 {missing_text}
 
 **해결 방법:**
-1. `.env.example`을 `.env`로 복사
-2. `.env` 파일에 필요한 값 입력
-3. 앱 재시작
-
-자세한 내용은 README.md를 참조하세요."""
+Settings 탭에서 Elasticsearch URL과 API Key를 입력하고 "설정 저장" 버튼을 클릭하세요."""
 
     return True, ""
 
