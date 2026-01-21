@@ -399,7 +399,9 @@ def save_settings(
     jina_api_key: str,
     hf_token: str
 ) -> str:
-    """Save settings to config.json"""
+    """Save settings to config.json and reinitialize clients"""
+    global _ingestion_manager, _search_manager
+
     config = get_config()
 
     config.set("elastic_url", elastic_url.strip())
@@ -408,16 +410,27 @@ def save_settings(
     config.set("hf_token", hf_token.strip())
 
     if config.save():
+        # Reset global managers to force reinitialization with new settings
+        _ingestion_manager = None
+        _search_manager = None
+
+        # Also reset ElasticClient singleton
+        try:
+            from backend.utils.elastic_client import ElasticClient
+            ElasticClient._instance = None
+        except Exception:
+            pass
+
         # Determine Jina mode
         jina_mode = "API 모드 ☁️" if jina_api_key.strip() else "로컬 모드 🖥️"
-        return f"""✅ **설정이 저장되었습니다!**
+        return f"""✅ **설정이 저장되고 적용되었습니다!**
 
 **현재 설정:**
 - Elasticsearch: {'✅ 설정됨' if elastic_url and elastic_api_key else '❌ 미설정'}
 - Jina V4: {jina_mode}
 - HuggingFace: {'✅ 설정됨' if hf_token else '⚪ 미설정 (선택사항)'}
 
-⚠️ **변경사항 적용을 위해 앱을 재시작하세요.**"""
+✅ **재시작 없이 바로 사용 가능합니다!**"""
     else:
         return "❌ 설정 저장 실패. 로그를 확인하세요."
 

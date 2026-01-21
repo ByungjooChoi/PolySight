@@ -32,9 +32,16 @@ class ElasticClient:
         return cls._instance
 
     def _init_client(self):
-        """Initialize Elasticsearch client"""
-        url = os.getenv("ELASTIC_CLOUD_SERVERLESS_URL")
-        api_key = os.getenv("ELASTIC_API_KEY")
+        """Initialize Elasticsearch client (config.json > .env)"""
+        # Try config.json first, then fall back to .env
+        try:
+            from backend.utils.config_manager import get_config
+            config = get_config()
+            url = config.elastic_url or os.getenv("ELASTIC_CLOUD_SERVERLESS_URL")
+            api_key = config.elastic_api_key or os.getenv("ELASTIC_API_KEY")
+        except Exception:
+            url = os.getenv("ELASTIC_CLOUD_SERVERLESS_URL")
+            api_key = os.getenv("ELASTIC_API_KEY")
 
         if not url or not api_key:
             logger.warning("ELASTIC_CLOUD_SERVERLESS_URL or ELASTIC_API_KEY not found.")
