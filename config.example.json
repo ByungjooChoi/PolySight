@@ -1,0 +1,6 @@
+{
+  "elastic_url": "https://your-elastic-cloud-url.es.elastic-cloud.com:443",
+  "elastic_api_key": "your-elastic-api-key-here",
+  "jina_api_key": "",
+  "jina_mode": "local"
+}
