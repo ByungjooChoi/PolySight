@@ -32,28 +32,46 @@ load_dotenv()
 def check_environment() -> dict:
     """
     Check all required environment settings and return status.
+    Checks both .env file AND config.json (config.json takes priority).
 
     Returns:
         dict with status of each required setting
     """
+    # Try to get config (may not be loaded yet at import time)
+    try:
+        from backend.utils.config_manager import get_config
+        config = get_config()
+        config_elastic_url = config.elastic_url
+        config_elastic_api_key = config.elastic_api_key
+        config_hf_token = config.hf_token
+    except Exception:
+        config_elastic_url = None
+        config_elastic_api_key = None
+        config_hf_token = None
+
+    # Check both sources (config.json priority > .env)
+    elastic_url = config_elastic_url or os.getenv("ELASTIC_CLOUD_SERVERLESS_URL")
+    elastic_api_key = config_elastic_api_key or os.getenv("ELASTIC_API_KEY")
+    hf_token = config_hf_token or os.getenv("HF_TOKEN")
+
     status = {
         "elastic_url": {
             "name": "ELASTIC_CLOUD_SERVERLESS_URL",
-            "value": os.getenv("ELASTIC_CLOUD_SERVERLESS_URL"),
+            "value": elastic_url,
             "required": True,
             "ok": False,
             "help": "Elastic Cloud Serverless 엔드포인트 URL"
         },
         "elastic_api_key": {
             "name": "ELASTIC_API_KEY",
-            "value": os.getenv("ELASTIC_API_KEY"),
+            "value": elastic_api_key,
             "required": True,
             "ok": False,
             "help": "Elastic Cloud API 키"
         },
         "hf_token": {
             "name": "HF_TOKEN",
-            "value": os.getenv("HF_TOKEN"),
+            "value": hf_token,
             "required": False,
             "ok": False,
             "help": "HuggingFace 토큰 (Jina V4 모델 다운로드용, 선택사항)"
