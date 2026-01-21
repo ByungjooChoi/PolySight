@@ -39,10 +39,11 @@ MANIFEST
 .DS_Store
 
 # Elastic / Project specific
-data/
+/data/
 logs/
 temp/
 hf_cache/
+*.cache/
 
 # AI Rules
 .clinerules
