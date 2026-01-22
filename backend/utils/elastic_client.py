@@ -6,6 +6,7 @@ Elasticsearch Client for PolySight
 """
 import os
 import logging
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from elasticsearch import Elasticsearch
 from dotenv import load_dotenv
@@ -76,6 +77,7 @@ class ElasticClient:
                     "page_number": {"type": "integer"},
                     "file_path": {"type": "keyword"},
                     "file_name": {"type": "keyword"},
+                    "image_path": {"type": "keyword"},  # Path to saved image for preview
                     "indexed_at": {"type": "date"}
                 }
             }
@@ -93,6 +95,7 @@ class ElasticClient:
                     "page_number": {"type": "integer"},
                     "file_path": {"type": "keyword"},
                     "file_name": {"type": "keyword"},
+                    "image_path": {"type": "keyword"},  # Path to saved image for preview
                     "indexed_at": {"type": "date"}
                 }
             }
@@ -121,7 +124,8 @@ class ElasticClient:
         visual_vectors: List[List[float]],
         page_number: int,
         file_path: str,
-        file_name: str
+        file_name: str,
+        image_path: Optional[str] = None
     ) -> bool:
         """
         Index multi-vectors for Visual Agent (Late Interaction).
@@ -132,6 +136,7 @@ class ElasticClient:
             page_number: Page number (0-indexed)
             file_path: Original file path
             file_name: Original file name
+            image_path: Path to saved image file for preview
         """
         if not self.client:
             logger.error("Elasticsearch client not initialized")
@@ -144,7 +149,8 @@ class ElasticClient:
                 "page_number": page_number,
                 "file_path": file_path,
                 "file_name": file_name,
-                "indexed_at": "now"
+                "image_path": image_path,
+                "indexed_at": datetime.now(timezone.utc).isoformat()
             }
 
             self.client.index(
@@ -192,19 +198,25 @@ class ElasticClient:
                     }
                 },
                 "size": size,
-                "_source": ["doc_id", "page_number", "file_path", "file_name"]
+                "_source": ["doc_id", "page_number", "file_path", "file_name", "image_path"],
+                "explain": True  # Get scoring explanation
             }
 
             response = self.client.search(index=self.VISUAL_INDEX, body=query)
 
             results = []
             for hit in response["hits"]["hits"]:
+                # Extract explanation if available
+                explanation = hit.get("_explanation", {})
+
                 results.append({
                     "doc_id": hit["_source"]["doc_id"],
                     "page_number": hit["_source"]["page_number"],
                     "file_path": hit["_source"]["file_path"],
                     "file_name": hit["_source"]["file_name"],
-                    "score": hit["_score"]
+                    "image_path": hit["_source"].get("image_path"),
+                    "score": hit["_score"],
+                    "explanation": explanation
                 })
 
             logger.info(f"MaxSim search returned {len(results)} results")
@@ -222,7 +234,8 @@ class ElasticClient:
         ocr_text: str,
         page_number: int,
         file_path: str,
-        file_name: str
+        file_name: str,
+        image_path: Optional[str] = None
     ) -> bool:
         """
         Index OCR text for Text Agent (BM25 search).
@@ -233,6 +246,7 @@ class ElasticClient:
             page_number: Page number (0-indexed)
             file_path: Original file path
             file_name: Original file name
+            image_path: Path to saved image file for preview
         """
         if not self.client:
             logger.error("Elasticsearch client not initialized")
@@ -245,7 +259,8 @@ class ElasticClient:
                 "page_number": page_number,
                 "file_path": file_path,
                 "file_name": file_name,
-                "indexed_at": "now"
+                "image_path": image_path,
+                "indexed_at": datetime.now(timezone.utc).isoformat()
             }
 
             self.client.index(
@@ -287,20 +302,41 @@ class ElasticClient:
                     }
                 },
                 "size": size,
-                "_source": ["doc_id", "page_number", "file_path", "file_name", "ocr_text"]
+                "_source": ["doc_id", "page_number", "file_path", "file_name", "ocr_text", "image_path"],
+                "highlight": {
+                    "fields": {
+                        "ocr_text": {
+                            "fragment_size": 150,
+                            "number_of_fragments": 2,
+                            "pre_tags": ["<mark>"],
+                            "post_tags": ["</mark>"]
+                        }
+                    }
+                },
+                "explain": True  # Get BM25 scoring explanation
             }
 
             response = self.client.search(index=self.TEXT_INDEX, body=query)
 
             results = []
             for hit in response["hits"]["hits"]:
+                # Get highlighted text if available
+                highlights = hit.get("highlight", {}).get("ocr_text", [])
+                highlight_text = " ... ".join(highlights) if highlights else ""
+
+                # Extract explanation if available
+                explanation = hit.get("_explanation", {})
+
                 results.append({
                     "doc_id": hit["_source"]["doc_id"],
                     "page_number": hit["_source"]["page_number"],
                     "file_path": hit["_source"]["file_path"],
                     "file_name": hit["_source"]["file_name"],
+                    "image_path": hit["_source"].get("image_path"),
                     "ocr_text": hit["_source"].get("ocr_text", "")[:500],  # Truncate for display
-                    "score": hit["_score"]
+                    "highlight": highlight_text,
+                    "score": hit["_score"],
+                    "explanation": explanation
                 })
 
             logger.info(f"BM25 search returned {len(results)} results")

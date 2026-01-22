@@ -9,6 +9,7 @@ import os
 import io
 import base64
 import logging
+import time
 import torch
 import requests
 from typing import List, Optional, Union
@@ -87,7 +88,12 @@ class TokenPooler:
         if self._pooler is None:
             try:
                 from colpali_engine.compression.token_pooling import HierarchicalTokenPooler
-                self._pooler = HierarchicalTokenPooler(pool_factor=self.pool_factor)
+                # HierarchicalTokenPooler API changed - try both styles
+                try:
+                    self._pooler = HierarchicalTokenPooler(pool_factor=self.pool_factor)
+                except TypeError:
+                    # Newer version takes no constructor args
+                    self._pooler = HierarchicalTokenPooler()
                 logger.info(f"TokenPooler initialized with pool_factor={self.pool_factor}")
             except ImportError:
                 logger.warning("colpali_engine not installed. Token pooling disabled.")
@@ -112,8 +118,11 @@ class TokenPooler:
             # Convert to tensor: (1, num_tokens, dim)
             tensor = torch.tensor(embeddings).unsqueeze(0)
 
-            # Apply pooling
-            pooled = self.pooler.pool_embeddings(tensor)
+            # Apply pooling - try with pool_factor arg first, then without
+            try:
+                pooled = self.pooler.pool_embeddings(tensor, pool_factor=self.pool_factor)
+            except TypeError:
+                pooled = self.pooler.pool_embeddings(tensor)
 
             # Convert back to list: (num_pooled_tokens, dim)
             result = pooled.squeeze(0).tolist()
@@ -145,72 +154,137 @@ class JinaAPIClient:
         image.save(buffered, format="PNG")
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    def embed_image(self, image: Image.Image) -> List[List[float]]:
+    def embed_image(self, image: Image.Image, max_retries: int = 3) -> List[List[float]]:
         """
         Generate multi-vector embedding for image via API.
+        Includes retry logic for rate limiting.
         """
-        try:
-            image_b64 = self._image_to_base64(image)
+        image_b64 = self._image_to_base64(image)
 
-            payload = {
-                "model": "jina-embeddings-v4",
-                "task": "retrieval.passage",
-                "input": [{"image": image_b64}],
-                "embedding_type": "float",
-                "return_multivector": True
-            }
+        # Log image info for debugging
+        img_size_kb = len(image_b64) * 3 / 4 / 1024  # Base64 is ~4/3 of original
+        logger.info(f"Embedding image: size={image.size}, mode={image.mode}, base64_size={img_size_kb:.1f}KB")
 
-            response = requests.post(
-                JINA_API_URL,
-                headers=self.headers,
-                json=payload,
-                timeout=60
-            )
-            response.raise_for_status()
+        payload = {
+            "model": "jina-embeddings-v4",
+            "task": "retrieval.passage",
+            "input": [{"image": image_b64}],
+            "embedding_type": "float",
+            "return_multivector": True
+        }
 
-            data = response.json()
-            embeddings = data["data"][0]["embedding"]
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    JINA_API_URL,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=60
+                )
 
-            logger.debug(f"API returned {len(embeddings)} vectors for image")
-            return embeddings
+                # Handle rate limiting with exponential backoff
+                if response.status_code == 429:
+                    # Log detailed rate limit info
+                    try:
+                        error_body = response.json()
+                        error_detail = error_body.get("detail", error_body)
+                    except Exception:
+                        error_detail = response.text[:500]
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Jina API request failed: {e}")
-            raise
-        except (KeyError, IndexError) as e:
-            logger.error(f"Jina API response parsing failed: {e}")
-            raise
+                    wait_time = (2 ** attempt) + 1  # 2, 3, 5 seconds
+                    logger.warning(f"Rate limited (429). Detail: {error_detail}")
+                    logger.warning(f"Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
 
-    def embed_query(self, query_text: str) -> List[List[float]]:
+                # Log other error responses
+                if response.status_code != 200:
+                    try:
+                        error_body = response.json()
+                        error_detail = error_body.get("detail", error_body)
+                    except Exception:
+                        error_detail = response.text[:500]
+                    logger.error(f"API error {response.status_code}: {error_detail}")
+
+                response.raise_for_status()
+
+                data = response.json()
+
+                # Handle both 'embedding' and 'embeddings' keys
+                first_item = data["data"][0]
+                if "embedding" in first_item:
+                    embeddings = first_item["embedding"]
+                elif "embeddings" in first_item:
+                    embeddings = first_item["embeddings"]
+                else:
+                    logger.error(f"Unexpected API response structure: {first_item.keys()}")
+                    raise KeyError(f"No embedding key found. Available keys: {first_item.keys()}")
+
+                logger.info(f"API returned {len(embeddings)} vectors for image")
+                return embeddings
+
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Jina API request failed after {max_retries} attempts: {e}")
+                    raise
+                logger.warning(f"Request failed, retrying... ({attempt + 1}/{max_retries})")
+                time.sleep(1)
+
+        raise RuntimeError("Failed to embed image after max retries")
+
+    def embed_query(self, query_text: str, max_retries: int = 3) -> List[List[float]]:
         """
         Generate multi-vector embedding for text query via API.
+        Includes retry logic for rate limiting.
         """
-        try:
-            payload = {
-                "model": "jina-embeddings-v4",
-                "task": "retrieval.query",
-                "input": [query_text],
-                "embedding_type": "float",
-                "return_multivector": True
-            }
+        payload = {
+            "model": "jina-embeddings-v4",
+            "task": "retrieval.query",
+            "input": [query_text],
+            "embedding_type": "float",
+            "return_multivector": True
+        }
 
-            response = requests.post(
-                JINA_API_URL,
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-            response.raise_for_status()
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    JINA_API_URL,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=30
+                )
 
-            data = response.json()
-            embeddings = data["data"][0]["embedding"]
+                # Handle rate limiting with exponential backoff
+                if response.status_code == 429:
+                    wait_time = (2 ** attempt) + 1
+                    logger.warning(f"Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
 
-            logger.debug(f"API returned {len(embeddings)} query vectors")
-            return embeddings
+                response.raise_for_status()
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Jina API request failed: {e}")
-            raise
+                data = response.json()
+
+                # Handle both 'embedding' and 'embeddings' keys
+                first_item = data["data"][0]
+                if "embedding" in first_item:
+                    embeddings = first_item["embedding"]
+                elif "embeddings" in first_item:
+                    embeddings = first_item["embeddings"]
+                else:
+                    raise KeyError(f"No embedding key found. Available keys: {first_item.keys()}")
+
+                logger.debug(f"API returned {len(embeddings)} query vectors")
+                return embeddings
+
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Jina API request failed after {max_retries} attempts: {e}")
+                    raise
+                logger.warning(f"Request failed, retrying... ({attempt + 1}/{max_retries})")
+                time.sleep(1)
+
+        raise RuntimeError("Failed to embed query after max retries")
 
 
 class VisualEmbedder:

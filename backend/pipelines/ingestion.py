@@ -31,7 +31,8 @@ class IngestionManager:
         self,
         visual_embedder: Optional[VisualEmbedder] = None,
         text_agent: Optional[TextAgent] = None,
-        elastic_client: Optional[ElasticClient] = None
+        elastic_client: Optional[ElasticClient] = None,
+        pool_factor: int = 3
     ):
         """
         Initialize Ingestion Manager.
@@ -40,17 +41,48 @@ class IngestionManager:
             visual_embedder: Visual Agent embedder (lazy loaded if None)
             text_agent: Text Agent (lazy loaded if None)
             elastic_client: Elasticsearch client
+            pool_factor: Token pooling factor (1=no pooling, 2-5 recommended)
         """
         self._visual_embedder = visual_embedder
         self._text_agent = text_agent
         self.elastic = elastic_client or ElasticClient()
         self.executor = ThreadPoolExecutor(max_workers=4)
+        self._pool_factor = pool_factor
+
+    @property
+    def pool_factor(self) -> int:
+        """Get current pool factor"""
+        return self._pool_factor
+
+    @pool_factor.setter
+    def pool_factor(self, value: int):
+        """Set pool factor and reset visual embedder to apply new setting"""
+        if value != self._pool_factor:
+            self._pool_factor = value
+            self._visual_embedder = None  # Reset to apply new pool_factor
+            logger.info(f"Pool factor changed to {value}")
 
     @property
     def visual_embedder(self) -> VisualEmbedder:
-        """Lazy load Visual Embedder"""
+        """Lazy load Visual Embedder with config-based mode selection"""
         if self._visual_embedder is None:
-            self._visual_embedder = VisualEmbedder()
+            # Get Jina config
+            try:
+                from backend.utils.config_manager import get_config
+                config = get_config()
+                jina_mode = config.jina_mode  # "local" or "api"
+                jina_api_key = config.jina_api_key
+            except Exception:
+                jina_mode = "local"
+                jina_api_key = None
+
+            self._visual_embedder = VisualEmbedder(
+                mode=jina_mode,
+                jina_api_key=jina_api_key,
+                pool_factor=self._pool_factor,
+                use_pooling=(self._pool_factor > 1)
+            )
+            logger.info(f"VisualEmbedder initialized with pool_factor={self._pool_factor}")
         return self._visual_embedder
 
     @property
@@ -225,7 +257,9 @@ class IngestionManager:
         image: Image.Image,
         doc_id: str,
         page_number: int = 0,
-        file_name: str = "unknown"
+        file_name: str = "unknown",
+        save_image: bool = True,
+        precomputed_text: str = None
     ) -> Dict[str, Any]:
         """
         Process a single PIL Image through both pipelines.
@@ -236,6 +270,8 @@ class IngestionManager:
             doc_id: Document ID
             page_number: Page number
             file_name: File name for metadata
+            save_image: Whether to save image to disk for preview
+            precomputed_text: Pre-extracted text (skip OCR if provided)
 
         Returns:
             Dict with processing stats
@@ -246,6 +282,27 @@ class IngestionManager:
         loop = asyncio.get_event_loop()
         visual_success = False
         text_success = False
+        image_path = None
+
+        # Save image to disk for preview (if enabled)
+        if save_image:
+            try:
+                # Create image storage directory
+                project_root = Path(__file__).parent.parent.parent
+                images_dir = project_root / "data" / "images"
+                images_dir.mkdir(parents=True, exist_ok=True)
+
+                # Save image with doc_id as filename
+                safe_doc_id = doc_id.replace("/", "_").replace("\\", "_")
+                image_filename = f"{safe_doc_id}_p{page_number}.png"
+                image_path = str(images_dir / image_filename)
+
+                # Save as PNG with reasonable quality
+                image.save(image_path, "PNG", optimize=True)
+                logger.debug(f"Saved image: {image_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save image for {doc_id}: {e}")
+                image_path = None
 
         # Visual Pipeline
         try:
@@ -259,25 +316,33 @@ class IngestionManager:
                 visual_vectors=multi_vectors,
                 page_number=page_number,
                 file_path="vidore_sample",
-                file_name=file_name
+                file_name=file_name,
+                image_path=image_path
             )
         except Exception as e:
             logger.error(f"Visual pipeline failed for {doc_id}: {e}")
 
-        # Text Pipeline
+        # Text Pipeline - use precomputed_text if available (skip OCR)
         try:
-            text = await loop.run_in_executor(
-                self.executor,
-                self.text_agent.extract_text,
-                image
-            )
-            if text.strip():
+            if precomputed_text is not None:
+                # Use pre-extracted text (e.g., from V3 markdown field)
+                text = precomputed_text
+            else:
+                # Run OCR
+                text = await loop.run_in_executor(
+                    self.executor,
+                    self.text_agent.extract_text,
+                    image
+                )
+
+            if text and text.strip():
                 text_success = self.elastic.index_text(
                     doc_id=doc_id,
                     ocr_text=text,
                     page_number=page_number,
                     file_path="vidore_sample",
-                    file_name=file_name
+                    file_name=file_name,
+                    image_path=image_path
                 )
         except Exception as e:
             logger.error(f"Text pipeline failed for {doc_id}: {e}")
@@ -285,8 +350,124 @@ class IngestionManager:
         return {
             "doc_id": doc_id,
             "visual_indexed": visual_success,
-            "text_indexed": text_success
+            "text_indexed": text_success,
+            "image_path": image_path
         }
+
+    async def process_images_batch(
+        self,
+        batch_data: List[Dict[str, Any]],
+        progress_callback=None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process multiple images through both pipelines using batch OCR.
+        Much more efficient than processing one by one.
+
+        Args:
+            batch_data: List of dicts with keys: image, doc_id, page_number, file_name
+            progress_callback: Optional callback(current, total, desc) for progress updates
+
+        Returns:
+            List of processing results
+        """
+        if not batch_data:
+            return []
+
+        # Ensure indices exist
+        self.elastic.ensure_indices()
+
+        loop = asyncio.get_event_loop()
+        results = []
+
+        # Extract images and metadata
+        images = [item["image"] for item in batch_data]
+        logger.info(f"Starting batch processing for {len(images)} images")
+
+        # Save all images to disk first (for preview)
+        image_paths = []
+        project_root = Path(__file__).parent.parent.parent
+        images_dir = project_root / "data" / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        for item in batch_data:
+            try:
+                safe_doc_id = item["doc_id"].replace("/", "_").replace("\\", "_")
+                image_filename = f"{safe_doc_id}_p{item['page_number']}.png"
+                image_path = str(images_dir / image_filename)
+                item["image"].save(image_path, "PNG", optimize=True)
+                image_paths.append(image_path)
+            except Exception as e:
+                logger.warning(f"Failed to save image: {e}")
+                image_paths.append(None)
+
+        # Batch OCR processing (the main optimization!)
+        logger.info(f"Running batch OCR on {len(images)} images...")
+        try:
+            ocr_texts = await loop.run_in_executor(
+                self.executor,
+                self.text_agent.process_images,
+                images,
+                True  # use_batch=True
+            )
+            logger.info(f"Batch OCR complete: {len(ocr_texts)} texts extracted")
+        except Exception as e:
+            logger.error(f"Batch OCR failed: {e}")
+            ocr_texts = [""] * len(images)
+
+        # Process each image: Visual embedding + indexing
+        for idx, (item, ocr_text, image_path) in enumerate(zip(batch_data, ocr_texts, image_paths)):
+            if progress_callback:
+                progress_callback(idx + 1, len(batch_data), f"인덱싱 {idx+1}/{len(batch_data)}")
+
+            image = item["image"]
+            doc_id = item["doc_id"]
+            page_number = item["page_number"]
+            file_name = item["file_name"]
+
+            visual_success = False
+            text_success = False
+
+            # Visual Pipeline (Jina API)
+            try:
+                multi_vectors = await loop.run_in_executor(
+                    self.executor,
+                    self.visual_embedder.embed_image,
+                    image
+                )
+                visual_success = self.elastic.index_visual(
+                    doc_id=doc_id,
+                    visual_vectors=multi_vectors,
+                    page_number=page_number,
+                    file_path="vidore_sample",
+                    file_name=file_name,
+                    image_path=image_path
+                )
+            except Exception as e:
+                logger.error(f"Visual pipeline failed for {doc_id}: {e}")
+
+            # Text indexing (already have OCR text from batch)
+            try:
+                if ocr_text and ocr_text.strip():
+                    text_success = self.elastic.index_text(
+                        doc_id=doc_id,
+                        ocr_text=ocr_text,
+                        page_number=page_number,
+                        file_path="vidore_sample",
+                        file_name=file_name,
+                        image_path=image_path
+                    )
+            except Exception as e:
+                logger.error(f"Text indexing failed for {doc_id}: {e}")
+
+            results.append({
+                "doc_id": doc_id,
+                "visual_indexed": visual_success,
+                "text_indexed": text_success,
+                "image_path": image_path
+            })
+
+        logger.info(f"Batch processing complete: {len(results)} documents processed")
+        return results
 
 
 class SearchManager:
@@ -304,9 +485,22 @@ class SearchManager:
 
     @property
     def visual_embedder(self) -> VisualEmbedder:
-        """Lazy load Visual Embedder"""
+        """Lazy load Visual Embedder with config-based mode selection"""
         if self._visual_embedder is None:
-            self._visual_embedder = VisualEmbedder()
+            # Get Jina config
+            try:
+                from backend.utils.config_manager import get_config
+                config = get_config()
+                jina_mode = config.jina_mode  # "local" or "api"
+                jina_api_key = config.jina_api_key
+            except Exception:
+                jina_mode = "local"
+                jina_api_key = None
+
+            self._visual_embedder = VisualEmbedder(
+                mode=jina_mode,
+                jina_api_key=jina_api_key
+            )
         return self._visual_embedder
 
     def search_visual(

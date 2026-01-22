@@ -10,16 +10,31 @@ import time
 import logging
 from pathlib import Path
 from typing import List, Tuple, Optional
+from datetime import datetime
 
 import gradio as gr
 
-logger = logging.getLogger(__name__)
-from dotenv import load_dotenv
-from PIL import Image
-
-# Set up paths
+# Set up paths first
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, project_root)
+
+# Setup logging to file
+log_dir = os.path.join(project_root, "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"polysight_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8')
+        # Console output removed - logs go to file only
+    ]
+)
+logger = logging.getLogger(__name__)
+
+from dotenv import load_dotenv
+from PIL import Image
 
 # Set HuggingFace cache
 hf_cache_dir = os.path.join(project_root, "hf_cache")
@@ -189,10 +204,14 @@ _ingestion_manager: Optional[IngestionManager] = None
 _search_manager: Optional[SearchManager] = None
 
 
-def get_ingestion_manager() -> IngestionManager:
+def get_ingestion_manager(pool_factor: int = 3) -> IngestionManager:
     global _ingestion_manager
     if _ingestion_manager is None:
-        _ingestion_manager = IngestionManager()
+        _ingestion_manager = IngestionManager(pool_factor=pool_factor)
+    else:
+        # Update pool_factor if changed
+        if _ingestion_manager.pool_factor != pool_factor:
+            _ingestion_manager.pool_factor = pool_factor
     return _ingestion_manager
 
 
@@ -203,59 +222,174 @@ def get_search_manager() -> SearchManager:
     return _search_manager
 
 
+def get_image_base64(image_path: str, max_size: tuple = (300, 400)) -> str:
+    """Convert image to base64 thumbnail for HTML embedding."""
+    import base64
+    from io import BytesIO
+
+    if not image_path or not os.path.exists(image_path):
+        return ""
+
+    try:
+        with Image.open(image_path) as img:
+            # Create thumbnail
+            img.thumbnail(max_size, Image.Resampling.LANCZOS)
+            # Convert to base64
+            buffer = BytesIO()
+            img.save(buffer, format="PNG", optimize=True)
+            img_base64 = base64.b64encode(buffer.getvalue()).decode()
+            return f"data:image/png;base64,{img_base64}"
+    except Exception as e:
+        logger.warning(f"Failed to load image {image_path}: {e}")
+        return ""
+
+
+def format_explanation_summary(explanation: dict, agent_type: str) -> str:
+    """Format Elasticsearch explanation into readable summary."""
+    if not explanation:
+        return ""
+
+    try:
+        if agent_type == "visual":
+            # MaxSim explanation - extract key info
+            desc = explanation.get("description", "")
+            if "maxSimDotProduct" in desc:
+                return "Late Interaction: max(query_token · doc_token) summed across all query tokens"
+            return "MaxSim multi-vector similarity"
+        else:
+            # BM25 explanation - extract term frequencies
+            desc = explanation.get("description", "")
+            details = explanation.get("details", [])
+
+            # Try to extract useful BM25 info
+            terms_info = []
+            for detail in details:
+                detail_desc = detail.get("description", "")
+                if "weight(" in detail_desc:
+                    # Extract term and field
+                    import re
+                    match = re.search(r'weight\(([^:]+):([^)]+)', detail_desc)
+                    if match:
+                        field, term = match.groups()
+                        term_score = detail.get("value", 0)
+                        terms_info.append(f'"{term.strip()}"={term_score:.2f}')
+
+            if terms_info:
+                return f"BM25 term scores: {', '.join(terms_info[:3])}"
+            return "BM25 (term frequency × inverse document frequency)"
+    except Exception:
+        pass
+
+    return ""
+
+
 def format_result_card(result: dict, rank: int, agent_type: str) -> str:
-    """Format a search result as HTML card"""
-    score = result.get("score", 0)
-    file_name = result.get("file_name", "Unknown")
-    page_num = result.get("page_number", 0) + 1  # 1-indexed for display
+    """Format a search result as HTML card with image preview (colpali style)"""
+    score = float(result.get("score", 0) or 0)
+    file_name = str(result.get("file_name", "Unknown"))
+    page_num_raw = result.get("page_number", 0)
+    page_num = (int(page_num_raw) if page_num_raw is not None else 0) + 1  # 1-indexed for display
+    image_path = result.get("image_path")
+    highlight = result.get("highlight", "")
+    explanation = result.get("explanation", {})
 
     if agent_type == "visual":
         badge_color = "#4CAF50"
         badge_text = "Visual"
+        score_label = "MaxSim"
     else:
         badge_color = "#2196F3"
         badge_text = "Text"
+        score_label = "BM25"
+
+    # Get image thumbnail (larger for better visibility like colpali)
+    img_base64 = get_image_base64(image_path) if image_path else ""
+
+    # Image HTML - centered and larger like colpali demo
+    if img_base64:
+        image_html = f'''
+        <div style="text-align: center; margin-bottom: 10px;">
+            <img src="{img_base64}" style="max-width: 100%; max-height: 200px; border: 1px solid #ddd; border-radius: 4px; object-fit: contain; box-shadow: 0 2px 4px rgba(0,0,0,0.1);" />
+        </div>
+        '''
+    else:
+        image_html = f'''
+        <div style="text-align: center; margin-bottom: 10px;">
+            <div style="width: 100%; height: 100px; background: #f0f0f0; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #999; font-size: 12px;">
+                📄 No Preview
+            </div>
+        </div>
+        '''
+
+    # Highlight text for BM25 results
+    highlight_html = ""
+    if highlight and agent_type == "text":
+        highlight_html = f'''
+        <div style="margin-top: 8px; padding: 6px 8px; background: #fffbeb; border-radius: 4px; font-size: 11px; border-left: 3px solid #f59e0b;">
+            {highlight}
+        </div>
+        '''
+
+    # Explanation summary
+    explain_summary = format_explanation_summary(explanation, agent_type)
+    explain_html = ""
+    if explain_summary:
+        explain_html = f'''
+        <div style="font-size: 10px; color: #666; margin-top: 4px; padding: 4px 6px; background: #f5f5f5; border-radius: 3px;">
+            💡 {explain_summary}
+        </div>
+        '''
 
     return f"""
-    <div style="border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin: 8px 0; background: #fafafa;">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-            <span style="font-weight: bold; font-size: 16px;">#{rank}</span>
-            <span style="background: {badge_color}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 12px;">{badge_text}</span>
+    <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.08);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-weight: bold; font-size: 18px; color: #333;">#{rank}</span>
+            <span style="background: {badge_color}; color: white; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 500;">{badge_text}</span>
         </div>
-        <div style="margin-top: 8px;">
-            <div><strong>File:</strong> {file_name}</div>
-            <div><strong>Page:</strong> {page_num}</div>
-            <div><strong>Score:</strong> {score:.4f}</div>
+        {image_html}
+        <div style="text-align: center;">
+            <div style="font-size: 12px; color: #555; margin-bottom: 4px;">{file_name}</div>
+            <div style="font-size: 11px; color: #888;">Page {page_num}</div>
+            <div style="margin-top: 8px; padding: 6px 12px; background: linear-gradient(135deg, {badge_color}22, {badge_color}11); border-radius: 6px; display: inline-block;">
+                <span style="font-size: 11px; color: #666;">{score_label}</span>
+                <span style="font-size: 16px; font-weight: bold; color: {badge_color}; margin-left: 4px;">{score:.4f}</span>
+            </div>
         </div>
+        {highlight_html}
+        {explain_html}
     </div>
     """
 
 
 def format_results_html(results: List[dict], agent_type: str, latency_ms: float) -> str:
-    """Format all results as HTML"""
+    """Format all results as HTML grid (colpali style)"""
     if not results:
         return f"""
-        <div style="text-align: center; padding: 20px; color: #666;">
+        <div style="text-align: center; padding: 40px; color: #666;">
             No results found
         </div>
         """
 
     header_color = "#4CAF50" if agent_type == "visual" else "#2196F3"
-    agent_name = "Visual Agent (MaxSim)" if agent_type == "visual" else "Text Agent (BM25)"
+    agent_name = "🔍 Visual Agent (MaxSim)" if agent_type == "visual" else "📝 Text Agent (BM25)"
 
+    # Grid layout like colpali demo
     html = f"""
     <div style="border: 2px solid {header_color}; border-radius: 12px; overflow: hidden;">
-        <div style="background: {header_color}; color: white; padding: 12px; text-align: center;">
-            <h3 style="margin: 0;">{agent_name}</h3>
-            <div style="font-size: 12px; opacity: 0.9;">Latency: {latency_ms:.1f}ms | Results: {len(results)}</div>
+        <div style="background: linear-gradient(135deg, {header_color}, {header_color}dd); color: white; padding: 14px; text-align: center;">
+            <h3 style="margin: 0; font-size: 16px;">{agent_name}</h3>
+            <div style="font-size: 12px; opacity: 0.9; margin-top: 4px;">
+                ⚡ {latency_ms:.1f}ms | 📊 {len(results)} results
+            </div>
         </div>
-        <div style="padding: 12px; max-height: 500px; overflow-y: auto;">
+        <div style="padding: 12px; background: #fafafa;">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;">
     """
 
     for i, result in enumerate(results, 1):
         html += format_result_card(result, i, agent_type)
 
-    html += "</div></div>"
+    html += "</div></div></div>"
     return html
 
 
@@ -303,12 +437,13 @@ def search_agents(query: str, num_results: int = 5) -> Tuple[str, str]:
         return error_html, error_html
 
 
-def ingest_files(files: List[str], progress=gr.Progress()) -> str:
+def ingest_files(files: List[str], pool_factor: int = 3, progress=gr.Progress()) -> str:
     """
     Ingest uploaded files through both pipelines.
 
     Args:
         files: List of file paths from gr.File
+        pool_factor: Token pooling factor
 
     Returns:
         Status message
@@ -321,7 +456,7 @@ def ingest_files(files: List[str], progress=gr.Progress()) -> str:
     if not is_valid:
         return error_msg
 
-    manager = get_ingestion_manager()
+    manager = get_ingestion_manager(pool_factor=pool_factor)
     results = []
     total = len(files)
 
@@ -527,86 +662,266 @@ def check_vidore_loaded() -> Tuple[bool, int]:
         return False, 0
 
 
-def load_vidore_samples(num_samples: int = 20, progress=gr.Progress()) -> str:
+# Default sample queries for DocVQA-style documents
+DEFAULT_SAMPLE_QUERIES = [
+    "What is the total amount?",
+    "What is the date?",
+    "Who signed this document?",
+    "What is the invoice number?",
+    "What is the company name?"
+]
+
+
+def generate_sample_queries_html(queries: list) -> str:
+    """Generate HTML for clickable sample query buttons."""
+    if not queries:
+        return ""
+
+    buttons = []
+    for q in queries:
+        # Escape special characters for safe HTML/JS embedding
+        safe_query = q.replace("'", "\\'").replace('"', "&quot;")
+
+        # Use single quotes for onclick attribute and escape properly
+        onclick = (
+            f"(function(btn){{"
+            f"var q=btn.getAttribute(&apos;data-query&apos;);"
+            f"var inp=document.querySelector(&apos;#search-query-input textarea&apos;)||document.querySelector(&apos;#search-query-input input&apos;);"
+            f"if(inp){{"
+            f"inp.value=q;"
+            f"inp.dispatchEvent(new Event(&apos;input&apos;,{{bubbles:true}}));"
+            f"setTimeout(function(){{var bs=document.querySelectorAll(&apos;button&apos;);for(var i=0;i<bs.length;i++){{if(bs[i].textContent.indexOf(&apos;Search&apos;)>=0){{bs[i].click();break;}}}}}},100);"
+            f"}}"
+            f"}})(this)"
+        )
+
+        btn = (
+            f'<button onclick="{onclick}" data-query="{safe_query}" '
+            f'style="margin: 4px; padding: 6px 12px; border: 1px solid #ddd; '
+            f'border-radius: 16px; background: #f5f5f5; cursor: pointer; '
+            f'font-size: 13px; transition: all 0.2s;" '
+            f'onmouseover="this.style.background=\'#e0e0e0\'" '
+            f'onmouseout="this.style.background=\'#f5f5f5\'">{q}</button>'
+        )
+        buttons.append(btn)
+
+    buttons_html = " ".join(buttons)
+
+    return f"""
+    <div style="margin: 10px 0; padding: 10px; background: #fafafa; border-radius: 8px;">
+        <span style="font-weight: bold; margin-right: 10px;">💡 예시 쿼리:</span>
+        {buttons_html}
+    </div>
     """
-    Load ViDoRe benchmark samples into the index using streaming.
-    No local download - streams directly from HuggingFace to Elasticsearch.
+
+
+SAMPLE_QUERIES_FILE = Path(__file__).parent.parent / "data" / "sample_queries.json"
+
+
+def save_sample_queries(queries: list):
+    """Save sample queries to file for persistence."""
+    try:
+        SAMPLE_QUERIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        with open(SAMPLE_QUERIES_FILE, "w") as f:
+            json.dump(queries, f)
+    except Exception as e:
+        logger.warning(f"Failed to save sample queries: {e}")
+
+
+def load_saved_sample_queries() -> list:
+    """Load sample queries from file."""
+    try:
+        import json
+        if SAMPLE_QUERIES_FILE.exists():
+            with open(SAMPLE_QUERIES_FILE, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def get_initial_sample_queries_html() -> str:
+    """Get sample queries HTML if documents exist in index."""
+    try:
+        from backend.utils.elastic_client import ElasticClient
+        client = ElasticClient()
+        # Check if there are documents in visual index
+        if client.client:
+            count = client.client.count(index=client.VISUAL_INDEX).get("count", 0)
+            if count > 0:
+                # Try to load saved queries from ViDoRe, fall back to defaults
+                queries = load_saved_sample_queries()
+                if not queries:
+                    queries = DEFAULT_SAMPLE_QUERIES
+                return generate_sample_queries_html(queries)
+    except Exception:
+        pass
+    return ""
+
+
+def load_vidore_samples(pool_factor: int = 3, progress=gr.Progress(track_tqdm=True)) -> tuple[str, str]:
     """
+    Load ViDoRe V3 benchmark samples into the index.
+    Loads 100 samples from each of 8 datasets (800 total).
+
+    Args:
+        pool_factor: Token pooling factor (1=no pooling, 2-5 recommended)
+
+    Returns:
+        tuple: (status_message, sample_queries_html)
+    """
+    # V3 datasets configuration
+    V3_DATASETS = [
+        ("vidore/vidore_v3_hr", "hr", "EU HR 문서"),
+        ("vidore/vidore_v3_finance_en", "finance_en", "금융 (영어)"),
+        ("vidore/vidore_v3_industrial", "industrial", "항공기 기술문서"),
+        ("vidore/vidore_v3_pharmaceuticals", "pharma", "제약 문서"),
+        ("vidore/vidore_v3_computer_science", "cs", "CS 교과서"),
+        ("vidore/vidore_v3_energy", "energy", "에너지 보고서"),
+        ("vidore/vidore_v3_physics", "physics", "물리학 슬라이드"),
+        ("vidore/vidore_v3_finance_fr", "finance_fr", "금융 (프랑스어)"),
+    ]
+    SAMPLES_PER_DATASET = 100
+    TOTAL_SAMPLES = len(V3_DATASETS) * SAMPLES_PER_DATASET
+
+    # Initialize progress bar immediately (fixes first-run issue)
+    progress(0, desc="시작 중...")
+
     # Check environment first
-    is_valid, error_msg = validate_environment_for_action("ViDoRe 샘플 로드")
+    is_valid, error_msg = validate_environment_for_action("ViDoRe V3 샘플 로드")
     if not is_valid:
-        return error_msg
+        return error_msg, ""
+
+    progress(0.02, desc="환경 확인 완료...")
 
     # Check if already loaded
     already_loaded, existing_count = check_vidore_loaded()
     if already_loaded:
-        return f"⚠️ ViDoRe 샘플이 이미 로드되어 있습니다! (현재 {existing_count}개 문서)\n\n다시 로드하려면 먼저 'Settings' 탭에서 인덱스를 초기화하세요."
+        return f"⚠️ ViDoRe 샘플이 이미 로드되어 있습니다! (현재 {existing_count}개 문서)\n\n다시 로드하려면 먼저 'Settings' 탭에서 인덱스를 초기화하세요.", ""
 
     try:
         from datasets import load_dataset
+        import time
 
-        progress(0.1, desc="HuggingFace 스트리밍 연결 중...")
-
-        # Stream directly from HuggingFace (no local download)
-        dataset = load_dataset(
-            "vidore/docvqa_test_subsampled",
-            split="test",
-            streaming=True,
-            trust_remote_code=True
-        )
-
-        manager = get_ingestion_manager()
+        manager = get_ingestion_manager(pool_factor=pool_factor)
+        logger.info(f"Loading ViDoRe V3 with pool_factor={pool_factor}")
         success_count = 0
         sample_queries = []
+        dataset_stats = {}
+        global_idx = 0
 
-        # Stream and process each sample
-        for i, sample in enumerate(dataset.take(num_samples)):
-            progress((i + 1) / num_samples * 0.9 + 0.1, desc=f"스트리밍 & 인덱싱 중... {i+1}/{num_samples}")
-
-            image = sample.get("image")
-            if image is None:
-                continue
-
-            # Collect sample queries
-            query = sample.get("query", "")
-            if query and len(sample_queries) < 5:
-                sample_queries.append(query)
+        for ds_idx, (dataset_name, domain, domain_desc) in enumerate(V3_DATASETS):
+            progress(ds_idx / len(V3_DATASETS), desc=f"[{ds_idx+1}/{len(V3_DATASETS)}] {domain_desc} 로딩 중...")
 
             try:
-                # Create unique doc_id with vidore prefix
-                doc_id = f"vidore_{sample.get('docId', f'doc_{i}')}_{sample.get('page', 0)}"
+                # V3 datasets require config name 'corpus' for documents
+                corpus = load_dataset(
+                    dataset_name,
+                    "corpus",
+                    split="test",  # V3 corpus uses 'test' split
+                    streaming=True
+                )
 
-                # Process through both pipelines (HuggingFace → Elasticsearch directly)
-                asyncio.run(manager.process_image(
-                    image=image,
-                    doc_id=doc_id,
-                    page_number=sample.get("page", 0),
-                    file_name=f"vidore_sample_{i}.png"
-                ))
-                success_count += 1
+                # Load queries for this domain (for sample queries display)
+                try:
+                    queries_ds = load_dataset(
+                        dataset_name,
+                        "queries",
+                        split="test",
+                        streaming=True
+                    )
+                    domain_queries = [q.get("query", "") or q.get("text", "") for q in queries_ds.take(3)]
+                    sample_queries.extend([q for q in domain_queries if q][:2])
+                except Exception as qe:
+                    logger.debug(f"Could not load queries for {dataset_name}: {qe}")
+
+                # Collect batch data for this dataset
+                batch_data = []
+                progress(ds_idx / len(V3_DATASETS), desc=f"[{ds_idx+1}/{len(V3_DATASETS)}] {domain_desc}: 샘플 수집 중...")
+
+                for i, sample in enumerate(corpus.take(SAMPLES_PER_DATASET)):
+                    # V3 corpus fields: image, doc_id, page_number_in_doc
+                    image = sample.get("image")
+                    if image is None:
+                        continue
+
+                    # V3 corpus fields (from HuggingFace viewer)
+                    raw_doc_id = sample.get('doc_id', f'doc_{i}')
+                    page_num = sample.get('page_number_in_doc', 0)
+                    doc_id = f"v3_{domain}_{raw_doc_id}_{page_num}"
+
+                    batch_data.append({
+                        "image": image,
+                        "doc_id": doc_id,
+                        "page_number": page_num,
+                        "file_name": f"v3_{domain}_{i}.png"
+                    })
+                    global_idx += 1
+
+                # Process batch
+                if batch_data:
+                    progress(
+                        (ds_idx + 0.5) / len(V3_DATASETS),
+                        desc=f"[{ds_idx+1}/{len(V3_DATASETS)}] {domain_desc}: 배치 처리 중 ({len(batch_data)}개)..."
+                    )
+
+                    def batch_progress(current, total, desc):
+                        p = (ds_idx + current / total) / len(V3_DATASETS)
+                        progress(p, desc=f"[{ds_idx+1}/{len(V3_DATASETS)}] {domain_desc}: {current}/{total}")
+
+                    try:
+                        results = asyncio.run(manager.process_images_batch(
+                            batch_data,
+                            progress_callback=batch_progress
+                        ))
+                        ds_success = sum(1 for r in results if r.get("visual_indexed") or r.get("text_indexed"))
+                        success_count += ds_success
+                    except Exception as e:
+                        logger.error(f"Batch processing failed for {domain}: {e}")
+                        ds_success = 0
+
+                dataset_stats[domain_desc] = ds_success
+                logger.info(f"Loaded {ds_success} samples from {dataset_name}")
 
             except Exception as e:
-                logger.error(f"Failed to process sample {i}: {e}")
+                logger.error(f"Failed to load dataset {dataset_name}: {e}")
+                dataset_stats[domain_desc] = 0
 
-        # Format sample queries collected during streaming
-        if not sample_queries:
-            sample_queries = ["What is the total amount?", "Find the date", "Who signed this document?"]
-        queries_text = "\n".join([f"  • {q}" for q in sample_queries])
+        # Filter and limit sample queries: prefer shorter ones, max 5
+        if sample_queries:
+            # Sort by length and take 5 shortest (more readable as buttons)
+            sample_queries = sorted(sample_queries, key=len)[:5]
+            save_sample_queries(sample_queries)
+        else:
+            sample_queries = DEFAULT_SAMPLE_QUERIES[:5]
 
-        return f"""✅ ViDoRe 샘플 스트리밍 & 인덱싱 완료!
+        queries_text = "\n".join([f"  • {q[:60]}..." if len(q) > 60 else f"  • {q}" for q in sample_queries])
 
-**결과:** {success_count}/{num_samples} 샘플 인덱싱 성공
-**방식:** HuggingFace → Elasticsearch 직접 스트리밍 (로컬 저장 없음)
+        # Format dataset stats
+        stats_text = "\n".join([f"  • {domain}: {count}개" for domain, count in dataset_stats.items()])
+
+        result_msg = f"""✅ ViDoRe V3 벤치마크 인덱싱 완료!
+
+**결과:** {success_count}/{TOTAL_SAMPLES} 샘플 인덱싱 성공
+
+**데이터셋별 현황:**
+{stats_text}
 
 **검색 예시 쿼리:**
 {queries_text}
 
 Search Battle 탭에서 위 쿼리로 검색해보세요!"""
 
+        # Generate HTML for sample query buttons
+        sample_queries_html = generate_sample_queries_html(sample_queries)
+
+        return result_msg, sample_queries_html
+
     except ImportError:
-        return "❌ datasets 라이브러리가 필요합니다. `pip install datasets` 실행하세요."
+        return "❌ datasets 라이브러리가 필요합니다. `pip install datasets` 실행하세요.", ""
     except Exception as e:
-        return f"❌ 에러 발생: {str(e)}"
+        return f"❌ 에러 발생: {str(e)}", ""
 
 
 # ========== Gradio UI ==========
@@ -617,6 +932,8 @@ with gr.Blocks(
     css="""
     .result-container { min-height: 400px; }
     .header-text { text-align: center; margin-bottom: 20px; }
+    .sample-query-btn { margin: 2px !important; }
+    .sample-queries-row { margin-top: 10px !important; }
     """
 ) as app:
 
@@ -637,6 +954,9 @@ with gr.Blocks(
     if setup_status:
         gr.HTML(setup_status)
 
+    # State for sample queries (populated when ViDoRe is loaded)
+    sample_queries_state = gr.State([])
+
     with gr.Tabs():
         # Tab 1: Search (Agent Battle)
         with gr.TabItem("🎯 Search Battle", id="search"):
@@ -644,7 +964,8 @@ with gr.Blocks(
                 query_input = gr.Textbox(
                     label="Search Query",
                     placeholder="Enter your search query...",
-                    scale=4
+                    scale=4,
+                    elem_id="search-query-input"
                 )
                 num_results = gr.Slider(
                     minimum=1,
@@ -655,6 +976,13 @@ with gr.Blocks(
                     scale=1
                 )
                 search_btn = gr.Button("🔍 Search", variant="primary", scale=1)
+
+            # Sample query buttons container (shows default queries if documents exist)
+            sample_queries_html = gr.HTML(
+                value=get_initial_sample_queries_html(),
+                visible=True,
+                elem_id="sample-queries-container"
+            )
 
             with gr.Row(equal_height=True):
                 visual_results = gr.HTML(
@@ -692,25 +1020,68 @@ with gr.Blocks(
 
             # ViDoRe Sample Loader Section
             gr.Markdown("---")
-            gr.Markdown("### 🎯 Quick Start: Load Demo Data")
+            gr.Markdown("### ⚙️ Embedding Settings")
 
             with gr.Row():
-                vidore_samples_slider = gr.Slider(
-                    minimum=5,
-                    maximum=50,
-                    value=20,
-                    step=5,
-                    label="Number of ViDoRe Samples",
+                pool_factor_slider = gr.Slider(
+                    minimum=1,
+                    maximum=5,
+                    value=3,
+                    step=1,
+                    label="Token Pooling Factor",
+                    info="1=풀링없음, 3=기본값(~94% 정확도), 높을수록 벡터 수 감소",
                     scale=2
                 )
-                vidore_btn = gr.Button("📥 Load ViDoRe Samples", variant="secondary", scale=1)
+                pool_factor_display = gr.Markdown(
+                    value="**현재 설정:** pool_factor=3 (벡터 수 ~1/3로 감소)",
+                    scale=1
+                )
+
+            def update_pool_factor_display(factor):
+                if factor == 1:
+                    return "**현재 설정:** pool_factor=1 (풀링 없음, 최대 정확도)"
+                else:
+                    reduction = f"~1/{factor}"
+                    accuracy = {2: "~97%", 3: "~94%", 4: "~91%", 5: "~88%"}.get(factor, "~90%")
+                    return f"**현재 설정:** pool_factor={factor} (벡터 수 {reduction}로 감소, 정확도 {accuracy})"
+
+            pool_factor_slider.change(
+                fn=update_pool_factor_display,
+                inputs=[pool_factor_slider],
+                outputs=[pool_factor_display]
+            )
+
+            gr.Markdown("---")
+            gr.Markdown("### 🎯 Quick Start: Load Demo Data")
+
+            gr.Markdown("""
+**ViDoRe Benchmark V3** - 엔터프라이즈 문서 검색 벤치마크
+
+8개 도메인에서 각 100개씩, 총 800개 샘플을 로드합니다:
+- 🏢 HR (EU 행정문서) · 💰 Finance EN/FR (금융)
+- ✈️ Industrial (항공기 기술) · 💊 Pharmaceuticals (제약)
+- 💻 Computer Science (CS 교과서) · ⚡ Energy (에너지 보고서)
+- 🔬 Physics (물리학 슬라이드)
+""")
+
+            with gr.Row():
+                vidore_btn = gr.Button("📥 Load ViDoRe V3 Samples (800개)", variant="secondary", scale=1)
 
             vidore_output = gr.Markdown(label="ViDoRe Load Results")
+            # Hidden state to pass sample queries HTML between callbacks
+            vidore_queries_state = gr.State("")
 
+            # Step 1: Run main ingestion with progress (only update Ingest tab components)
+            # Step 2: Update Search tab's sample_queries_html via .then() chain
             vidore_btn.click(
                 fn=load_vidore_samples,
-                inputs=[vidore_samples_slider],
-                outputs=[vidore_output]
+                inputs=[pool_factor_slider],
+                outputs=[vidore_output, vidore_queries_state],
+                show_progress="full"
+            ).then(
+                fn=lambda x: x,  # Pass through the HTML
+                inputs=[vidore_queries_state],
+                outputs=[sample_queries_html]
             )
 
             gr.Markdown("---")
@@ -731,7 +1102,7 @@ with gr.Blocks(
 
             ingest_btn.click(
                 fn=ingest_files,
-                inputs=[file_upload],
+                inputs=[file_upload, pool_factor_slider],
                 outputs=[ingest_output]
             )
 
