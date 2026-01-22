@@ -522,12 +522,19 @@ class SearchManager:
         start = time.time()
 
         # Generate query multi-vectors
+        embed_start = time.time()
         query_vectors = self.visual_embedder.embed_query(query)
+        embed_time = (time.time() - embed_start) * 1000
+        logger.info(f"[Visual Search] Query embedding: {embed_time:.0f}ms, vectors: {len(query_vectors)}")
 
         # Search with MaxSim
+        search_start = time.time()
         results = self.elastic.search_visual_maxsim(query_vectors, size)
+        search_time = (time.time() - search_start) * 1000
+        logger.info(f"[Visual Search] MaxSim search: {search_time:.0f}ms, results: {len(results)}")
 
         latency = (time.time() - start) * 1000
+        logger.info(f"[Visual Search] Total: {latency:.0f}ms (embed={embed_time:.0f}ms + search={search_time:.0f}ms)")
         return results, latency
 
     def search_text(

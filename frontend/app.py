@@ -244,6 +244,33 @@ def get_image_base64(image_path: str, max_size: tuple = (300, 400)) -> str:
         return ""
 
 
+def get_full_image_base64(image_path: str) -> str:
+    """Convert full-size image to base64 for modal display."""
+    import base64
+    from io import BytesIO
+
+    if not image_path or not os.path.exists(image_path):
+        return ""
+
+    try:
+        with Image.open(image_path) as img:
+            # Keep original size but limit to reasonable max for web display
+            max_dimension = 1600
+            if img.width > max_dimension or img.height > max_dimension:
+                ratio = min(max_dimension / img.width, max_dimension / img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            # Convert to base64
+            buffer = BytesIO()
+            img.save(buffer, format="PNG", quality=95)
+            img_base64 = base64.b64encode(buffer.getvalue()).decode()
+            return f"data:image/png;base64,{img_base64}"
+    except Exception as e:
+        logger.warning(f"Failed to load full image {image_path}: {e}")
+        return ""
+
+
 def format_explanation_summary(explanation: dict, agent_type: str) -> str:
     """Format Elasticsearch explanation into readable summary."""
     if not explanation:
@@ -304,12 +331,35 @@ def format_result_card(result: dict, rank: int, agent_type: str) -> str:
 
     # Get image thumbnail (larger for better visibility like colpali)
     img_base64 = get_image_base64(image_path) if image_path else ""
+    # Get full-size image for modal
+    full_img_base64 = get_full_image_base64(image_path) if image_path else ""
 
-    # Image HTML - centered and larger like colpali demo
+    # Unique ID for this card's modal
+    modal_id = f"modal_{agent_type}_{rank}_{hash(str(image_path)) % 10000}"
+
+    # Image HTML - clickable thumbnail that opens modal with full-size image
     if img_base64:
         image_html = f'''
         <div style="text-align: center; margin-bottom: 10px;">
-            <img src="{img_base64}" style="max-width: 100%; max-height: 200px; border: 1px solid #ddd; border-radius: 4px; object-fit: contain; box-shadow: 0 2px 4px rgba(0,0,0,0.1);" />
+            <img src="{img_base64}"
+                 onclick="document.getElementById('{modal_id}').style.display='flex'"
+                 style="max-width: 100%; max-height: 200px; border: 1px solid #ddd; border-radius: 4px; object-fit: contain; box-shadow: 0 2px 4px rgba(0,0,0,0.1); cursor: pointer; transition: transform 0.2s, box-shadow 0.2s;"
+                 onmouseover="this.style.transform='scale(1.02)'; this.style.boxShadow='0 4px 12px rgba(0,0,0,0.2)'"
+                 onmouseout="this.style.transform='scale(1)'; this.style.boxShadow='0 2px 4px rgba(0,0,0,0.1)'"
+                 title="클릭하여 원본 보기" />
+            <div style="font-size: 10px; color: #888; margin-top: 4px;">🔍 클릭하여 확대</div>
+        </div>
+        <!-- Modal for full-size image -->
+        <div id="{modal_id}" onclick="if(event.target===this)this.style.display='none'"
+             style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 9999; justify-content: center; align-items: center; cursor: pointer;">
+            <div style="position: relative; max-width: 90%; max-height: 90%; background: white; border-radius: 8px; padding: 10px; box-shadow: 0 20px 60px rgba(0,0,0,0.5);">
+                <button onclick="document.getElementById('{modal_id}').style.display='none'"
+                        style="position: absolute; top: -12px; right: -12px; width: 32px; height: 32px; border-radius: 50%; border: none; background: #ff4444; color: white; font-size: 18px; cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.3); z-index: 10000;">✕</button>
+                <img src="{full_img_base64}" style="max-width: 85vw; max-height: 80vh; object-fit: contain; border-radius: 4px;" />
+                <div style="text-align: center; padding: 10px; color: #333; font-size: 14px;">
+                    <strong>{file_name}</strong> | Page {page_num} | {score_label}: {score:.4f}
+                </div>
+            </div>
         </div>
         '''
     else:
@@ -662,13 +712,18 @@ def check_vidore_loaded() -> Tuple[bool, int]:
         return False, 0
 
 
-# Default sample queries for DocVQA-style documents
+# Default sample queries - ViDoRe V3 공식 쿼리 및 샘플 문서 매칭 쿼리
+# 우리가 인덱싱한 샘플 문서들을 검색할 수 있는 쿼리들
 DEFAULT_SAMPLE_QUERIES = [
-    "What is the total amount?",
-    "What is the date?",
-    "Who signed this document?",
-    "What is the invoice number?",
-    "What is the company name?"
+    # ViDoRe V3 HR 공식 쿼리 (query_id=4) - ground truth: corpus_id 12, 25
+    "estimated skilled labor needs for EU green transition by 2030",
+    # HR 도메인 추가 쿼리
+    "European Green Deal employment impact",
+    "skills investment needs for green transition",
+    # Finance 도메인
+    "JPMorgan Chase financial performance 2024",
+    # CS 도메인
+    "Python programming basics",
 ]
 
 
@@ -807,7 +862,6 @@ def load_vidore_samples(pool_factor: int = 3, progress=gr.Progress(track_tqdm=Tr
         manager = get_ingestion_manager(pool_factor=pool_factor)
         logger.info(f"Loading ViDoRe V3 with pool_factor={pool_factor}")
         success_count = 0
-        sample_queries = []
         dataset_stats = {}
         global_idx = 0
 
@@ -822,19 +876,6 @@ def load_vidore_samples(pool_factor: int = 3, progress=gr.Progress(track_tqdm=Tr
                     split="test",  # V3 corpus uses 'test' split
                     streaming=True
                 )
-
-                # Load queries for this domain (for sample queries display)
-                try:
-                    queries_ds = load_dataset(
-                        dataset_name,
-                        "queries",
-                        split="test",
-                        streaming=True
-                    )
-                    domain_queries = [q.get("query", "") or q.get("text", "") for q in queries_ds.take(3)]
-                    sample_queries.extend([q for q in domain_queries if q][:2])
-                except Exception as qe:
-                    logger.debug(f"Could not load queries for {dataset_name}: {qe}")
 
                 # Collect batch data for this dataset
                 batch_data = []
@@ -888,13 +929,9 @@ def load_vidore_samples(pool_factor: int = 3, progress=gr.Progress(track_tqdm=Tr
                 logger.error(f"Failed to load dataset {dataset_name}: {e}")
                 dataset_stats[domain_desc] = 0
 
-        # Filter and limit sample queries: prefer shorter ones, max 5
-        if sample_queries:
-            # Sort by length and take 5 shortest (more readable as buttons)
-            sample_queries = sorted(sample_queries, key=len)[:5]
-            save_sample_queries(sample_queries)
-        else:
-            sample_queries = DEFAULT_SAMPLE_QUERIES[:5]
+        # 항상 우리가 정의한 샘플 문서 매칭 쿼리 사용
+        sample_queries = DEFAULT_SAMPLE_QUERIES[:5]
+        save_sample_queries(sample_queries)
 
         queries_text = "\n".join([f"  • {q[:60]}..." if len(q) > 60 else f"  • {q}" for q in sample_queries])
 
@@ -926,16 +963,14 @@ Search Battle 탭에서 위 쿼리로 검색해보세요!"""
 
 # ========== Gradio UI ==========
 
-with gr.Blocks(
-    title="PolySight - Agent Battle",
-    theme=gr.themes.Soft(),
-    css="""
-    .result-container { min-height: 400px; }
-    .header-text { text-align: center; margin-bottom: 20px; }
-    .sample-query-btn { margin: 2px !important; }
-    .sample-queries-row { margin-top: 10px !important; }
-    """
-) as app:
+CUSTOM_CSS = """
+.result-container { min-height: 400px; }
+.header-text { text-align: center; margin-bottom: 20px; }
+.sample-query-btn { margin: 2px !important; }
+.sample-queries-row { margin-top: 10px !important; }
+"""
+
+with gr.Blocks(title="PolySight - Agent Battle") as app:
 
     # Header
     gr.Markdown(
@@ -1032,10 +1067,9 @@ with gr.Blocks(
                     info="1=풀링없음, 3=기본값(~94% 정확도), 높을수록 벡터 수 감소",
                     scale=2
                 )
-                pool_factor_display = gr.Markdown(
-                    value="**현재 설정:** pool_factor=3 (벡터 수 ~1/3로 감소)",
-                    scale=1
-                )
+            pool_factor_display = gr.Markdown(
+                value="**현재 설정:** pool_factor=3 (벡터 수 ~1/3로 감소)"
+            )
 
             def update_pool_factor_display(factor):
                 if factor == 1:
@@ -1241,5 +1275,7 @@ if __name__ == "__main__":
     app.launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=False
+        share=False,
+        theme=gr.themes.Soft(),
+        css=CUSTOM_CSS
     )
