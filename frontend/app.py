@@ -313,6 +313,7 @@ def format_explanation_summary(explanation: dict, agent_type: str) -> str:
 def format_result_card(result: dict, rank: int, agent_type: str) -> str:
     """Format a search result as HTML card with image preview (colpali style)"""
     score = float(result.get("score", 0) or 0)
+    raw_score = result.get("raw_score")  # For visual search, this is the unnormalized score
     file_name = str(result.get("file_name", "Unknown"))
     page_num_raw = result.get("page_number", 0)
     page_num = (int(page_num_raw) if page_num_raw is not None else 0) + 1  # 1-indexed for display
@@ -323,7 +324,11 @@ def format_result_card(result: dict, rank: int, agent_type: str) -> str:
     if agent_type == "visual":
         badge_color = "#4CAF50"
         badge_text = "Visual"
-        score_label = "MaxSim"
+        # Show normalized score with raw score in tooltip
+        if raw_score is not None:
+            score_label = f"Score (raw: {raw_score:.2f})"
+        else:
+            score_label = "MaxSim"
     else:
         badge_color = "#2196F3"
         badge_text = "Text"
@@ -443,9 +448,20 @@ def format_results_html(results: List[dict], agent_type: str, latency_ms: float)
     return html
 
 
-def search_agents(query: str, num_results: int = 5) -> Tuple[str, str]:
+def search_agents(
+    query: str,
+    num_results: int = 5,
+    visual_threshold: float = 0.0,
+    normalize_scores: bool = True
+) -> Tuple[str, str]:
     """
     Search using both agents and return formatted results.
+
+    Args:
+        query: Search query text
+        num_results: Number of results to return
+        visual_threshold: Minimum normalized score for visual results (0=no filter)
+        normalize_scores: Whether to normalize visual scores
 
     Returns:
         Tuple of (visual_html, text_html)
@@ -462,7 +478,16 @@ def search_agents(query: str, num_results: int = 5) -> Tuple[str, str]:
 
     try:
         manager = get_search_manager()
-        results = manager.search_both(query, size=num_results)
+
+        # Convert threshold: 0.0 means no filtering
+        threshold = visual_threshold if visual_threshold > 0 else None
+
+        results = manager.search_both(
+            query,
+            size=num_results,
+            normalize_visual=normalize_scores,
+            visual_threshold=threshold
+        )
 
         visual_html = format_results_html(
             results["visual_agent"]["results"],
@@ -1012,6 +1037,23 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
                 )
                 search_btn = gr.Button("🔍 Search", variant="primary", scale=1)
 
+            # Advanced search options (collapsible)
+            with gr.Accordion("⚙️ Advanced Options", open=False):
+                with gr.Row():
+                    visual_threshold = gr.Slider(
+                        minimum=0.0,
+                        maximum=1.0,
+                        value=0.0,
+                        step=0.05,
+                        label="Visual Score Threshold",
+                        info="0=필터없음, 0.5=중간 유사도 이상만, 0.7=높은 유사도만"
+                    )
+                    normalize_scores = gr.Checkbox(
+                        label="Normalize Scores",
+                        value=True,
+                        info="쿼리 길이와 무관하게 0-1 범위로 정규화"
+                    )
+
             # Sample query buttons container (shows default queries if documents exist)
             sample_queries_html = gr.HTML(
                 value=get_initial_sample_queries_html(),
@@ -1032,12 +1074,12 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
             # Search event handlers
             search_btn.click(
                 fn=search_agents,
-                inputs=[query_input, num_results],
+                inputs=[query_input, num_results, visual_threshold, normalize_scores],
                 outputs=[visual_results, text_results]
             )
             query_input.submit(
                 fn=search_agents,
-                inputs=[query_input, num_results],
+                inputs=[query_input, num_results, visual_threshold, normalize_scores],
                 outputs=[visual_results, text_results]
             )
 

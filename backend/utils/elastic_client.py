@@ -168,7 +168,9 @@ class ElasticClient:
     def search_visual_maxsim(
         self,
         query_vectors: List[List[float]],
-        size: int = 5
+        size: int = 5,
+        normalize_scores: bool = True,
+        min_score_threshold: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """
         Search using MaxSim (Late Interaction) on rank_vectors.
@@ -176,15 +178,21 @@ class ElasticClient:
         Args:
             query_vectors: Multi-vector query embedding
             size: Number of results to return
+            normalize_scores: If True, normalize scores by query token count (default: True)
+            min_score_threshold: Minimum normalized score threshold (0-1). Results below this are filtered.
+                                If None, no threshold is applied.
 
         Returns:
-            List of search results with scores
+            List of search results with scores (normalized if normalize_scores=True)
         """
         if not self.client:
             logger.error("Elasticsearch client not initialized")
             return []
 
         try:
+            # Request more results if we're filtering by threshold
+            fetch_size = size * 3 if min_score_threshold else size
+
             query = {
                 "query": {
                     "script_score": {
@@ -197,15 +205,30 @@ class ElasticClient:
                         }
                     }
                 },
-                "size": size,
+                "size": fetch_size,
                 "_source": ["doc_id", "page_number", "file_path", "file_name", "image_path"],
                 "explain": True  # Get scoring explanation
             }
 
             response = self.client.search(index=self.VISUAL_INDEX, body=query)
 
+            # Calculate normalization factor
+            num_query_tokens = len(query_vectors)
+
             results = []
             for hit in response["hits"]["hits"]:
+                raw_score = hit["_score"]
+
+                # Normalize score by query token count
+                if normalize_scores and num_query_tokens > 0:
+                    normalized_score = raw_score / num_query_tokens
+                else:
+                    normalized_score = raw_score
+
+                # Apply threshold filter
+                if min_score_threshold is not None and normalized_score < min_score_threshold:
+                    continue
+
                 # Extract explanation if available
                 explanation = hit.get("_explanation", {})
 
@@ -215,11 +238,17 @@ class ElasticClient:
                     "file_path": hit["_source"]["file_path"],
                     "file_name": hit["_source"]["file_name"],
                     "image_path": hit["_source"].get("image_path"),
-                    "score": hit["_score"],
+                    "score": normalized_score,  # Return normalized score
+                    "raw_score": raw_score,     # Keep raw score for debugging
                     "explanation": explanation
                 })
 
-            logger.info(f"MaxSim search returned {len(results)} results")
+                # Stop once we have enough results
+                if len(results) >= size:
+                    break
+
+            logger.info(f"MaxSim search returned {len(results)} results "
+                       f"(normalized={normalize_scores}, threshold={min_score_threshold})")
             return results
 
         except Exception as e:

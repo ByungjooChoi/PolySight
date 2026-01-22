@@ -506,7 +506,9 @@ class SearchManager:
     def search_visual(
         self,
         query: str,
-        size: int = 5
+        size: int = 5,
+        normalize_scores: bool = True,
+        min_score_threshold: float = None
     ) -> Tuple[List[Dict[str, Any]], float]:
         """
         Search using Visual Agent (MaxSim).
@@ -514,6 +516,8 @@ class SearchManager:
         Args:
             query: Search query text
             size: Number of results
+            normalize_scores: If True, normalize scores by query token count
+            min_score_threshold: Minimum normalized score (0-1) to filter results
 
         Returns:
             Tuple of (results, latency_ms)
@@ -527,9 +531,14 @@ class SearchManager:
         embed_time = (time.time() - embed_start) * 1000
         logger.info(f"[Visual Search] Query embedding: {embed_time:.0f}ms, vectors: {len(query_vectors)}")
 
-        # Search with MaxSim
+        # Search with MaxSim (with normalization)
         search_start = time.time()
-        results = self.elastic.search_visual_maxsim(query_vectors, size)
+        results = self.elastic.search_visual_maxsim(
+            query_vectors,
+            size,
+            normalize_scores=normalize_scores,
+            min_score_threshold=min_score_threshold
+        )
         search_time = (time.time() - search_start) * 1000
         logger.info(f"[Visual Search] MaxSim search: {search_time:.0f}ms, results: {len(results)}")
 
@@ -564,7 +573,9 @@ class SearchManager:
     def search_both(
         self,
         query: str,
-        size: int = 5
+        size: int = 5,
+        normalize_visual: bool = True,
+        visual_threshold: float = None
     ) -> Dict[str, Any]:
         """
         Search using both agents and compare results.
@@ -572,11 +583,17 @@ class SearchManager:
         Args:
             query: Search query text
             size: Number of results per agent
+            normalize_visual: Normalize visual search scores
+            visual_threshold: Minimum normalized score for visual results
 
         Returns:
             Dict with both results and comparison
         """
-        visual_results, visual_latency = self.search_visual(query, size)
+        visual_results, visual_latency = self.search_visual(
+            query, size,
+            normalize_scores=normalize_visual,
+            min_score_threshold=visual_threshold
+        )
         text_results, text_latency = self.search_text(query, size)
 
         return {
