@@ -10,8 +10,9 @@
 
 ## 프로젝트 개요
 
-**PolySight**는 Visual Agent vs Text Agent의 "Agent Battle" 데모입니다.
-동일한 쿼리에 대해 두 에이전트가 경쟁하여 결과를 비교합니다.
+**PolySight**는 두 가지 차원의 프로젝트입니다:
+1. **ColPali vs OCR 비교 (Agent Battle)** — Visual Agent vs Text Agent의 검색 결과 비교 (v1 완료)
+2. **Morphik의 ES 버전** — Morphik(PostgreSQL+pgvector)이 하는 것을 Elasticsearch로 구현 (v2 진행 중)
 
 ### 핵심 기술 스택
 - **Visual Agent**: Jina V4 Multi-vector (128 dim) + Late Interaction (MaxSim)
@@ -162,7 +163,7 @@
 
 ---
 
-## 완료 상태 요약
+## v1 완료 상태 요약
 
 | Phase | 설명 | 상태 |
 |-------|------|------|
@@ -176,9 +177,169 @@
 
 ---
 
-## 다음 단계 (Future Work)
+# v2: Morphik의 ES 버전 + Agent Battle 확장
 
-- [ ] 검색 결과에 이미지 썸네일 표시
-- [ ] 검색 품질 메트릭 (MRR, NDCG) 표시
-- [ ] 다국어 쿼리 지원 개선
-- [ ] 배치 인덱싱 성능 최적화
+## 프로젝트 비전
+
+PolySight는 두 가지 차원으로 구성된다:
+1. **ColPali vs OCR 비교 (Agent Battle)** — PolySight 고유의 차별점 (v1 완료)
+2. **Morphik의 ES 버전** — Morphik이 PostgreSQL+pgvector로 하는 것을 Elasticsearch로 구현
+
+## 기술 제약 사항 (확인 완료)
+
+| 항목 | 결론 |
+|------|------|
+| `semantic_text` 필드 | sparse(ELSER) + dense 벡터만 지원. **rank_vectors 불가** |
+| `rank_vectors` + RRF | `script_score`(maxSimDotProduct)를 `standard` retriever로 감싸면 RRF sub-retriever로 **사용 가능** |
+| RRF sub-retriever 종류 | standard, kNN, sparse_vector, text_similarity_reranker |
+| RRF 제약 | 최소 2개 sub-retriever 필요, search_after 불가, 커스텀 sort 불가 |
+
+---
+
+## Phase 8: Hybrid Search (RRF) — 최우선
+
+### 목표
+기존 2분할(Visual vs Text)에 **Hybrid(RRF 블렌딩)** 결과를 추가.
+DevTools에서 직접 쿼리를 보여준 후 → UI에서 비교 데모.
+
+### 8.1 RRF 쿼리 구현
+- [x] `backend/utils/elastic_client.py`에 `search_hybrid_rrf()` 메서드 추가
+- [x] RRF retriever 구조: `script_score`(MaxSim) + `multi_match`(BM25) sub-retrievers
+- [x] 현재 인덱스가 분리(visual_index / text_index)되어 있으므로 **통합 인덱스 생성** 완료
+  - ES RRF retriever는 하나의 인덱스 안에서 동작하므로 통합이 필수
+
+### 8.2 통합 인덱스 설계
+- [x] `polysight-unified` 인덱스 매핑: visual_vectors(rank_vectors) + text_content(text) + metadata
+- [x] 인덱싱 파이프라인 수정: `process_image()`, `process_images_batch()`에 unified indexing 추가
+- [x] 기존 분리 인덱스는 Agent Battle 비교용으로 유지
+
+### 8.3 2-way RRF 쿼리
+- [x] Sub-retriever 1: `script_score` + maxSimDotProduct (Visual)
+- [x] Sub-retriever 2: `multi_match` BM25 (Text/Keyword)
+- [x] `get_rrf_query_json()` — DevTools에서 복사/실행 가능한 JSON 생성
+- [ ] (향후 필요 시 semantic_text 필드 추가 + reindex → 3-way 확장 가능)
+
+### 8.4 UI 확장
+- [x] Agent Battle 탭에 Hybrid 결과 패널 추가 (3분할 레이아웃)
+- [x] 각 결과의 RRF 순위/스코어 표시
+- [x] DevTools용 쿼리 복사 (Accordion + gr.Code)
+- [x] RRF Rank Constant (k) 슬라이더 추가
+
+### 8.5 데모 시나리오
+- [ ] DevTools에서 RRF 쿼리 직접 실행 → "이게 ES의 Hybrid Search입니다"
+- [ ] PolySight UI에서 같은 쿼리를 시각적으로 → "이걸 UI로 감싸면 이렇게 됩니다"
+- [ ] MSG FAQ 데모처럼 단계별 진행: BM25만 → Visual만 → Hybrid RRF
+
+---
+
+## Phase 9: 다양한 문서 포맷 지원
+
+### 목표
+Morphik 수준의 문서 지원 (PDF 외 DOCX, PPTX, XLSX 등)
+
+### 9.1 Office 문서 처리
+- [x] python-docx → 텍스트 추출 + 페이지 이미지 변환 (DocxProcessor)
+- [x] python-pptx → 슬라이드 이미지 변환 (PptxProcessor)
+- [x] openpyxl → 시트 테이블 이미지 변환 (XlsxProcessor)
+- [x] 공통 인터페이스: `DocumentProcessor.to_pages(file) → List[PIL.Image]`
+- [x] `DocumentProcessor.extract_text(file)` — OCR 없이 직접 텍스트 추출
+
+### 9.2 텍스트/데이터 파일
+- [x] TXT, MD, HTML, XML, YAML, code files → TextFileProcessor
+- [x] CSV/TSV → CsvProcessor (테이블 시각화 이미지)
+- [x] JSON → JsonProcessor (list of dicts → 테이블, 그 외 → 포맷된 텍스트)
+
+### 9.3 업로드 UI 확장
+- [x] Gradio 파일 업로드에 36개 포맷 지원 추가
+- [x] process_uploaded_file() → DocumentProcessor 자동 라우팅
+- [x] Text Pipeline: Office/텍스트 문서는 OCR 대신 직접 추출 (_process_text_native)
+
+---
+
+## Phase 10: 비디오 처리
+
+### 목표
+Morphik의 비디오 검색 기능을 ES 버전으로 구현
+
+### 10.1 비디오 → 프레임 추출
+- [ ] ffmpeg로 N초 간격 프레임 추출
+- [ ] 각 프레임을 PageImage로 변환 → Visual 임베딩
+
+### 10.2 오디오 → 텍스트 전사
+- [ ] Whisper API (또는 로컬 Whisper) 로 오디오 트랙 전사
+- [ ] 타임스탬프 포함 텍스트 → Text 인덱싱
+
+### 10.3 비디오 검색 UI
+- [ ] "이 장면 찾아줘" → 타임스탬프 + 프레임 썸네일 반환
+- [ ] 별도 "Video Search" 탭
+
+---
+
+## Phase 11: Agentic Search
+
+### 목표
+Gemini 대화에서 논의한 "Agent Battle Arena" — 두 Agent의 추론 과정 비교
+
+### 11.1 LLM Tool Use 구현
+- [x] Anthropic Claude API tool_use로 에이전트 루프 구현 (HTTP requests 기반)
+- [x] Visual Agent: visual_search tool만 사용 가능
+- [x] Text Agent: text_search tool만 사용 가능
+- [x] Hybrid Agent: hybrid_search tool 사용
+- [x] AgentBattleArena — 다중 에이전트 동시 실행 및 비교
+
+### 11.2 추론 과정 스트리밍
+- [x] 에이전트의 사고 과정(Thought Log)을 HTML 타임라인으로 표시
+- [x] ThoughtStep 데이터클래스 (thinking/tool_call/tool_result/answer)
+- [x] Generator 기반 run() + 동기 run_sync() 지원
+
+### 11.3 Agent Battle 2.0
+- [x] 3분할: Visual Agent vs Text Agent vs Hybrid Agent 추론 과정 비교
+- [x] 검색 결과뿐 아니라 "왜 이 결과를 골랐는지" 사고 로그 표시
+- [x] Agent Arena 탭 (Gradio UI) — 에이전트 선택 체크박스, 토큰/시간 통계
+
+---
+
+## Phase 12: 웹 데모 배포
+
+### 목표
+URL 부여해서 지속적으로 접근 가능한 데모 사이트
+
+### 12.1 배포
+- [x] GCP GPU VM 생성 (g2-standard-8, NVIDIA L4, us-west1-a, polysight-gpu)
+- [x] 방화벽 규칙 설정 (TCP 7860 for Gradio, 태그: polysight)
+- [x] API Key 보안 패턴 정립 (.env > config.json, .gitignore 적용)
+- [x] GPU 서버 셋업 가이드 작성 (GPU_SERVER_SETUP.md)
+- [ ] VM SSH 접속 후 PolySight 설치 및 실행
+- [ ] ES Cloud Serverless 외부 연결 검증
+
+### 12.2 인터랙티브 프레젠테이션 (별도 세션)
+- [ ] Elastic 브랜드 가이드라인 적용한 소개 페이지
+- [ ] 프로젝트 소개 + 인터랙티브 데모를 하나의 HTML로
+- [ ] 참고: elastic-brand-skill.md, Ashish/David의 vibe-coded presso
+
+---
+
+## 전체 우선순위 요약
+
+| 순서 | Phase | 핵심 | 예상 난이도 | 상태 |
+|------|-------|------|-------------|------|
+| — | Phase 1~7 | v1 Agent Battle | — | ✅ 완료 |
+| 1 | **Phase 8: Hybrid Search (RRF)** | ES의 최대 강점 데모 | 중 | ✅ 구현 완료 (8.5 데모 시나리오 제외) |
+| 2 | Phase 9: 다양한 문서 포맷 | Morphik 대응 | 하 | ✅ 구현 완료 |
+| 3 | Phase 10: 비디오 처리 | Morphik 대응 | 중상 | 미착수 |
+| 4 | Phase 11: Agentic Search | Agent Battle 2.0 | 상 | ✅ 구현 완료 |
+| 5 | Phase 12: 웹 배포 | 데모 사이트 | 하 | 미착수 |
+
+---
+
+## 데모 시나리오 (최종)
+
+### DevTools 데모 (5분)
+1. BM25 검색 → "키워드만으로는 이 정도"
+2. Visual 검색 (maxSimDotProduct) → "이미지를 직접 이해하면 이만큼"
+3. Hybrid RRF → "ES가 알아서 합쳐주면 이렇게 됩니다"
+
+### PolySight UI 데모 (10분)
+1. Agent Battle: Visual vs OCR 2분할 → "차이가 보이시죠?"
+2. Hybrid Search: Visual + BM25 RRF → "합치면 더 좋습니다"
+3. (향후) Agentic Search → "에이전트가 직접 판단합니다"

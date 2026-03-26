@@ -148,9 +148,18 @@ class ConfigManager:
         return bool(self.elastic_url and self.elastic_api_key)
 
     @property
+    def anthropic_api_key(self) -> str:
+        return self._config.get("anthropic_api_key", "")
+
+    @property
     def is_jina_api_configured(self) -> bool:
         """Check if Jina API is configured"""
         return bool(self.jina_api_key)
+
+    @property
+    def is_anthropic_configured(self) -> bool:
+        """Check if Anthropic API is configured"""
+        return bool(self.anthropic_api_key)
 
     def get_status(self) -> Dict[str, Any]:
         """Get configuration status for UI display"""

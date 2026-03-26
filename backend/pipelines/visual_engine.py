@@ -58,14 +58,20 @@ class PDFProcessor:
 def process_uploaded_file(file_path: str) -> List[Image.Image]:
     """
     Process uploaded file and return list of images.
-    Supports PDF and common image formats.
+    Supports PDF, images, Office docs (DOCX, PPTX, XLSX),
+    and text files (TXT, MD, CSV, JSON, HTML, etc.).
     """
+    from backend.pipelines.document_processor import DocumentProcessor
+
     ext = Path(file_path).suffix.lower()
 
+    # PDF and images — fast path (original behavior)
     if ext == ".pdf":
         return PDFProcessor.convert_to_images(file_path)
-    elif ext in [".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp", ".gif"]:
+    elif ext in DocumentProcessor.IMAGE_EXTENSIONS:
         return [Image.open(file_path).convert("RGB")]
+    elif DocumentProcessor.is_supported(file_path):
+        return DocumentProcessor.to_pages(file_path)
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 

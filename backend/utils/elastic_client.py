@@ -25,6 +25,7 @@ class ElasticClient:
     # Index names
     VISUAL_INDEX = "polysight-visual"
     TEXT_INDEX = "polysight-text"
+    UNIFIED_INDEX = "polysight-unified"
 
     def __new__(cls):
         if cls._instance is None:
@@ -101,9 +102,34 @@ class ElasticClient:
             }
         }
 
+        # Unified Index: visual + text in one document for RRF Hybrid Search
+        unified_mapping = {
+            "mappings": {
+                "properties": {
+                    "visual_vectors": {
+                        "type": "rank_vectors"  # Jina V4 multi-vector (pooled)
+                    },
+                    "text_content": {
+                        "type": "text",
+                        "analyzer": "standard"
+                    },
+                    "page_image": {
+                        "type": "binary"  # Base64-encoded page image
+                    },
+                    "doc_id": {"type": "keyword"},
+                    "page_number": {"type": "integer"},
+                    "source_file": {"type": "keyword"},
+                    "file_name": {"type": "keyword"},
+                    "image_path": {"type": "keyword"},
+                    "indexed_at": {"type": "date"}
+                }
+            }
+        }
+
         indices = {
             self.VISUAL_INDEX: visual_mapping,
-            self.TEXT_INDEX: text_mapping
+            self.TEXT_INDEX: text_mapping,
+            self.UNIFIED_INDEX: unified_mapping
         }
 
         for index_name, mapping in indices.items():
@@ -375,6 +401,242 @@ class ElasticClient:
             logger.error(f"BM25 search failed: {e}")
             return []
 
+    # ========== Unified Index (Hybrid / RRF) ==========
+
+    def index_unified(
+        self,
+        doc_id: str,
+        visual_vectors: Optional[List[List[float]]],
+        text_content: Optional[str],
+        page_number: int,
+        source_file: str,
+        file_name: str,
+        image_path: Optional[str] = None,
+        page_image_base64: Optional[str] = None
+    ) -> bool:
+        """
+        Index a page into the unified index with both visual vectors and text.
+        Enables RRF Hybrid Search across visual and text modalities.
+
+        Args:
+            doc_id: Unique document ID
+            visual_vectors: Multi-vector embedding from Jina V4 (pooled)
+            text_content: OCR-extracted text from Docling
+            page_number: Page number (0-indexed)
+            source_file: Original file path
+            file_name: Original file name
+            image_path: Path to saved image file for preview
+            page_image_base64: Base64-encoded page image
+        """
+        if not self.client:
+            logger.error("Elasticsearch client not initialized")
+            return False
+
+        try:
+            doc = {
+                "doc_id": doc_id,
+                "page_number": page_number,
+                "source_file": source_file,
+                "file_name": file_name,
+                "image_path": image_path,
+                "indexed_at": datetime.now(timezone.utc).isoformat()
+            }
+
+            # Only include non-empty fields
+            if visual_vectors:
+                doc["visual_vectors"] = visual_vectors
+            if text_content and text_content.strip():
+                doc["text_content"] = text_content
+            if page_image_base64:
+                doc["page_image"] = page_image_base64
+
+            self.client.index(
+                index=self.UNIFIED_INDEX,
+                id=f"{doc_id}_page_{page_number}",
+                document=doc
+            )
+            logger.debug(f"Indexed unified: {doc_id} page {page_number}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to index unified document: {e}")
+            return False
+
+    def search_hybrid_rrf(
+        self,
+        query_vectors: Optional[List[List[float]]] = None,
+        query_text: Optional[str] = None,
+        size: int = 5,
+        rank_window_size: int = 50,
+        rank_constant: int = 60
+    ) -> List[Dict[str, Any]]:
+        """
+        Hybrid search using RRF (Reciprocal Rank Fusion) on the unified index.
+        Combines Visual (MaxSim) and Text (BM25) sub-retrievers.
+
+        Args:
+            query_vectors: Multi-vector query embedding for visual search
+            query_text: Text query for BM25 search
+            size: Number of results to return
+            rank_window_size: Window size for RRF ranking (default 50)
+            rank_constant: RRF constant k (default 60, higher = more equal weighting)
+
+        Returns:
+            List of search results with RRF rank scores
+        """
+        if not self.client:
+            logger.error("Elasticsearch client not initialized")
+            return []
+
+        if not query_vectors and not query_text:
+            logger.error("At least one of query_vectors or query_text is required")
+            return []
+
+        try:
+            # Build sub-retrievers
+            retrievers = []
+
+            if query_vectors:
+                # Sub-retriever 1: Visual (MaxSim via script_score)
+                visual_retriever = {
+                    "standard": {
+                        "query": {
+                            "script_score": {
+                                "query": {"match_all": {}},
+                                "script": {
+                                    "source": "maxSimDotProduct(params.query_vector, 'visual_vectors')",
+                                    "params": {
+                                        "query_vector": query_vectors
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                retrievers.append(visual_retriever)
+
+            if query_text:
+                # Sub-retriever 2: Text (BM25)
+                text_retriever = {
+                    "standard": {
+                        "query": {
+                            "multi_match": {
+                                "query": query_text,
+                                "fields": ["text_content"]
+                            }
+                        }
+                    }
+                }
+                retrievers.append(text_retriever)
+
+            # Build RRF query
+            rrf_query = {
+                "retriever": {
+                    "rrf": {
+                        "retrievers": retrievers,
+                        "rank_window_size": rank_window_size,
+                        "rank_constant": rank_constant
+                    }
+                },
+                "size": size,
+                "_source": [
+                    "doc_id", "page_number", "source_file", "file_name",
+                    "text_content", "image_path"
+                ]
+            }
+
+            response = self.client.search(index=self.UNIFIED_INDEX, body=rrf_query)
+
+            results = []
+            for rank, hit in enumerate(response["hits"]["hits"], 1):
+                source = hit["_source"]
+                text_snippet = source.get("text_content", "")
+                if text_snippet and len(text_snippet) > 500:
+                    text_snippet = text_snippet[:500] + "..."
+
+                results.append({
+                    "doc_id": source.get("doc_id", ""),
+                    "page_number": source.get("page_number", 0),
+                    "file_path": source.get("source_file", ""),
+                    "file_name": source.get("file_name", ""),
+                    "image_path": source.get("image_path"),
+                    "text_content": text_snippet,
+                    "score": hit.get("_score", 0),
+                    "rrf_rank": rank,
+                    "explanation": {"type": "rrf", "sub_retrievers": len(retrievers)}
+                })
+
+            logger.info(f"RRF Hybrid search returned {len(results)} results "
+                       f"(sub-retrievers={len(retrievers)}, k={rank_constant})")
+            return results
+
+        except Exception as e:
+            logger.error(f"RRF Hybrid search failed: {e}")
+            return []
+
+    def get_rrf_query_json(
+        self,
+        query_vectors: Optional[List[List[float]]] = None,
+        query_text: Optional[str] = None,
+        size: int = 5,
+        rank_window_size: int = 50,
+        rank_constant: int = 60
+    ) -> str:
+        """
+        Generate the RRF query JSON for DevTools copy/paste.
+        Used in demos to show the raw Elasticsearch query.
+        """
+        import json
+
+        retrievers = []
+
+        if query_vectors:
+            retrievers.append({
+                "standard": {
+                    "query": {
+                        "script_score": {
+                            "query": {"match_all": {}},
+                            "script": {
+                                "source": "maxSimDotProduct(params.query_vector, 'visual_vectors')",
+                                "params": {"query_vector": "<<QUERY_VECTORS>>"}
+                            }
+                        }
+                    }
+                }
+            })
+
+        if query_text:
+            retrievers.append({
+                "standard": {
+                    "query": {
+                        "multi_match": {
+                            "query": query_text,
+                            "fields": ["text_content"]
+                        }
+                    }
+                }
+            })
+
+        rrf_body = {
+            "retriever": {
+                "rrf": {
+                    "retrievers": retrievers,
+                    "rank_window_size": rank_window_size,
+                    "rank_constant": rank_constant
+                }
+            },
+            "size": size
+        }
+
+        query_json = json.dumps(rrf_body, indent=2, ensure_ascii=False)
+        # Replace placeholder with note about actual vectors
+        if query_vectors:
+            query_json = query_json.replace(
+                '"<<QUERY_VECTORS>>"',
+                '"[... Jina V4 multi-vector ...]"'
+            )
+        return f"GET /polysight-unified/_search\n{query_json}"
+
     # ========== Utility Methods ==========
 
     def get_index_count(self, index_name: str) -> int:
@@ -407,7 +669,7 @@ class ElasticClient:
     def clear_all_indices(self) -> bool:
         """Clear all PolySight indices"""
         success = True
-        for index in [self.VISUAL_INDEX, self.TEXT_INDEX]:
+        for index in [self.VISUAL_INDEX, self.TEXT_INDEX, self.UNIFIED_INDEX]:
             if not self.delete_index(index):
                 success = False
         return success

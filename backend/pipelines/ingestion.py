@@ -100,8 +100,16 @@ class IngestionManager:
         """
         Process a file through both Visual and Text pipelines.
 
+        For Office/text documents (DOCX, PPTX, XLSX, CSV, etc.):
+        - Visual: renders document to page images → Jina V4 multi-vector
+        - Text: extracts text directly (no OCR needed) → BM25
+
+        For PDF/images:
+        - Visual: page images → Jina V4 multi-vector
+        - Text: OCR via Docling → BM25
+
         Args:
-            file_path: Path to the file (PDF or image)
+            file_path: Path to the file
             doc_id: Optional document ID (auto-generated if None)
 
         Returns:
@@ -112,6 +120,7 @@ class IngestionManager:
 
         file_name = Path(file_path).name
         doc_id = doc_id or str(uuid.uuid4())
+        ext = Path(file_path).suffix.lower()
 
         logger.info(f"Processing file: {file_name} (doc_id: {doc_id})")
 
@@ -128,13 +137,31 @@ class IngestionManager:
 
         logger.info(f"Loaded {len(images)} images from {file_name}")
 
+        # Check if this is a text-native file (Office/text — skip OCR)
+        text_native_exts = {
+            ".docx", ".doc", ".pptx", ".xlsx", ".xls",
+            ".txt", ".md", ".csv", ".tsv", ".json",
+            ".html", ".htm", ".xml", ".yaml", ".yml",
+            ".py", ".js", ".ts", ".java", ".go", ".rs",
+            ".c", ".cpp", ".h", ".log", ".toml", ".ini", ".cfg"
+        }
+        is_text_native = ext in text_native_exts
+
         # Process through both pipelines in parallel
         visual_task = self._process_visual_pipeline(
             images, doc_id, file_path, file_name
         )
-        text_task = self._process_text_pipeline(
-            images, doc_id, file_path, file_name
-        )
+
+        if is_text_native:
+            # Direct text extraction (no OCR needed — more accurate)
+            text_task = self._process_text_native(
+                file_path, doc_id, file_name, len(images)
+            )
+        else:
+            # OCR-based text extraction (PDF/images)
+            text_task = self._process_text_pipeline(
+                images, doc_id, file_path, file_name
+            )
 
         visual_count, text_count = await asyncio.gather(visual_task, text_task)
 
@@ -145,6 +172,63 @@ class IngestionManager:
             "visual_count": visual_count,
             "text_count": text_count
         }
+
+    async def _process_text_native(
+        self,
+        file_path: str,
+        doc_id: str,
+        file_name: str,
+        page_count: int
+    ) -> int:
+        """
+        Extract text directly from text-native documents (no OCR).
+        Indexes the full document text as a single text entry per page.
+        """
+        loop = asyncio.get_event_loop()
+
+        try:
+            from backend.pipelines.document_processor import DocumentProcessor
+
+            text = await loop.run_in_executor(
+                self.executor,
+                DocumentProcessor.extract_text,
+                file_path
+            )
+
+            if not text.strip():
+                logger.warning(f"No text extracted from {file_name}")
+                return 0
+
+            # Split text into page-sized chunks for multi-page docs
+            lines = text.split("\n")
+            lines_per_page = max(1, len(lines) // max(1, page_count))
+            count = 0
+
+            for page_num in range(page_count):
+                start = page_num * lines_per_page
+                end = start + lines_per_page if page_num < page_count - 1 else len(lines)
+                page_text = "\n".join(lines[start:end])
+
+                if not page_text.strip():
+                    continue
+
+                success = self.elastic.index_text(
+                    doc_id=doc_id,
+                    ocr_text=page_text,
+                    page_number=page_num,
+                    file_path=file_path,
+                    file_name=file_name
+                )
+                if success:
+                    count += 1
+
+            logger.info(f"Text Native Pipeline complete: {count}/{page_count} indexed for {file_name}")
+            return count
+
+        except Exception as e:
+            logger.error(f"Text native extraction failed for {file_name}: {e}")
+            # Fallback: return 0, Visual pipeline still works
+            return 0
 
     async def _process_visual_pipeline(
         self,
@@ -283,6 +367,8 @@ class IngestionManager:
         visual_success = False
         text_success = False
         image_path = None
+        multi_vectors = None
+        extracted_text = None
 
         # Save image to disk for preview (if enabled)
         if save_image:
@@ -325,20 +411,18 @@ class IngestionManager:
         # Text Pipeline - use precomputed_text if available (skip OCR)
         try:
             if precomputed_text is not None:
-                # Use pre-extracted text (e.g., from V3 markdown field)
-                text = precomputed_text
+                extracted_text = precomputed_text
             else:
-                # Run OCR
-                text = await loop.run_in_executor(
+                extracted_text = await loop.run_in_executor(
                     self.executor,
                     self.text_agent.extract_text,
                     image
                 )
 
-            if text and text.strip():
+            if extracted_text and extracted_text.strip():
                 text_success = self.elastic.index_text(
                     doc_id=doc_id,
-                    ocr_text=text,
+                    ocr_text=extracted_text,
                     page_number=page_number,
                     file_path="vidore_sample",
                     file_name=file_name,
@@ -346,6 +430,22 @@ class IngestionManager:
                 )
         except Exception as e:
             logger.error(f"Text pipeline failed for {doc_id}: {e}")
+
+        # Unified Index (for RRF Hybrid Search)
+        # Indexes both visual vectors and text into a single document
+        try:
+            self.elastic.index_unified(
+                doc_id=doc_id,
+                visual_vectors=multi_vectors if visual_success else None,
+                text_content=extracted_text if (extracted_text and extracted_text.strip()) else None,
+                page_number=page_number,
+                source_file="vidore_sample",
+                file_name=file_name,
+                image_path=image_path
+            )
+            logger.debug(f"Unified indexed: {doc_id} page {page_number}")
+        except Exception as e:
+            logger.warning(f"Unified indexing failed for {doc_id}: {e}")
 
         return {
             "doc_id": doc_id,
@@ -459,6 +559,20 @@ class IngestionManager:
             except Exception as e:
                 logger.error(f"Text indexing failed for {doc_id}: {e}")
 
+            # Unified Index (for RRF Hybrid Search)
+            try:
+                self.elastic.index_unified(
+                    doc_id=doc_id,
+                    visual_vectors=multi_vectors if visual_success else None,
+                    text_content=ocr_text if (ocr_text and ocr_text.strip()) else None,
+                    page_number=page_number,
+                    source_file="vidore_sample",
+                    file_name=file_name,
+                    image_path=image_path
+                )
+            except Exception as e:
+                logger.warning(f"Unified indexing failed for {doc_id}: {e}")
+
             results.append({
                 "doc_id": doc_id,
                 "visual_indexed": visual_success,
@@ -570,6 +684,50 @@ class SearchManager:
         latency = (time.time() - start) * 1000
         return results, latency
 
+    def search_hybrid(
+        self,
+        query: str,
+        size: int = 5,
+        rank_constant: int = 60
+    ) -> Tuple[List[Dict[str, Any]], float, str]:
+        """
+        Search using RRF Hybrid (Visual + Text combined).
+
+        Args:
+            query: Search query text
+            size: Number of results
+            rank_constant: RRF constant k (higher = more equal weighting)
+
+        Returns:
+            Tuple of (results, latency_ms, devtools_query)
+        """
+        import time
+        start = time.time()
+
+        # Generate query multi-vectors for visual sub-retriever
+        query_vectors = self.visual_embedder.embed_query(query)
+
+        # RRF Hybrid search
+        results = self.elastic.search_hybrid_rrf(
+            query_vectors=query_vectors,
+            query_text=query,
+            size=size,
+            rank_constant=rank_constant
+        )
+
+        latency = (time.time() - start) * 1000
+
+        # Generate DevTools query for copy/paste demo
+        devtools_query = self.elastic.get_rrf_query_json(
+            query_vectors=query_vectors,
+            query_text=query,
+            size=size,
+            rank_constant=rank_constant
+        )
+
+        logger.info(f"[Hybrid Search] RRF returned {len(results)} results in {latency:.0f}ms")
+        return results, latency, devtools_query
+
     def search_both(
         self,
         query: str,
@@ -607,5 +765,50 @@ class SearchManager:
                 "results": text_results,
                 "latency_ms": text_latency,
                 "count": len(text_results)
+            }
+        }
+
+    def search_all(
+        self,
+        query: str,
+        size: int = 5,
+        normalize_visual: bool = True,
+        visual_threshold: float = None,
+        rank_constant: int = 60
+    ) -> Dict[str, Any]:
+        """
+        Search using all three modes: Visual, Text, and Hybrid RRF.
+        For the full Agent Battle comparison.
+
+        Returns:
+            Dict with visual, text, and hybrid results
+        """
+        visual_results, visual_latency = self.search_visual(
+            query, size,
+            normalize_scores=normalize_visual,
+            min_score_threshold=visual_threshold
+        )
+        text_results, text_latency = self.search_text(query, size)
+        hybrid_results, hybrid_latency, devtools_query = self.search_hybrid(
+            query, size, rank_constant=rank_constant
+        )
+
+        return {
+            "query": query,
+            "visual_agent": {
+                "results": visual_results,
+                "latency_ms": visual_latency,
+                "count": len(visual_results)
+            },
+            "text_agent": {
+                "results": text_results,
+                "latency_ms": text_latency,
+                "count": len(text_results)
+            },
+            "hybrid_agent": {
+                "results": hybrid_results,
+                "latency_ms": hybrid_latency,
+                "count": len(hybrid_results),
+                "devtools_query": devtools_query
             }
         }

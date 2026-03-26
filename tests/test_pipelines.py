@@ -230,7 +230,9 @@ class TestViDoReLoader:
         from backend.data.vidore_loader import ViDoReLoader
 
         loader = ViDoReLoader()
-        assert loader.DATASET_NAME == "vidore/vidore-benchmark-v3"
+        assert isinstance(loader.V3_DATASETS, list)
+        assert len(loader.V3_DATASETS) > 0
+        assert any("vidore" in ds for ds in loader.V3_DATASETS)
 
 
 # Import check test

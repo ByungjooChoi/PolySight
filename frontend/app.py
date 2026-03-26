@@ -277,7 +277,10 @@ def format_explanation_summary(explanation: dict, agent_type: str) -> str:
         return ""
 
     try:
-        if agent_type == "visual":
+        if agent_type == "hybrid":
+            sub_count = explanation.get("sub_retrievers", 2)
+            return f"RRF: {sub_count} sub-retrievers (MaxSim + BM25) fused by reciprocal rank"
+        elif agent_type == "visual":
             # MaxSim explanation - extract key info
             desc = explanation.get("description", "")
             if "maxSimDotProduct" in desc:
@@ -329,6 +332,10 @@ def format_result_card(result: dict, rank: int, agent_type: str) -> str:
             score_label = f"Score (raw: {raw_score:.2f})"
         else:
             score_label = "MaxSim"
+    elif agent_type == "hybrid":
+        badge_color = "#9C27B0"
+        badge_text = "Hybrid"
+        score_label = "RRF Rank"
     else:
         badge_color = "#2196F3"
         badge_text = "Text"
@@ -425,8 +432,14 @@ def format_results_html(results: List[dict], agent_type: str, latency_ms: float)
         </div>
         """
 
-    header_color = "#4CAF50" if agent_type == "visual" else "#2196F3"
-    agent_name = "🔍 Visual Agent (MaxSim)" if agent_type == "visual" else "📝 Text Agent (BM25)"
+    color_map = {"visual": "#4CAF50", "text": "#2196F3", "hybrid": "#9C27B0"}
+    name_map = {
+        "visual": "🔍 Visual Agent (MaxSim)",
+        "text": "📝 Text Agent (BM25)",
+        "hybrid": "⚡ Hybrid Agent (RRF)"
+    }
+    header_color = color_map.get(agent_type, "#2196F3")
+    agent_name = name_map.get(agent_type, "Agent")
 
     # Grid layout like colpali demo
     html = f"""
@@ -452,29 +465,31 @@ def search_agents(
     query: str,
     num_results: int = 5,
     visual_threshold: float = 0.0,
-    normalize_scores: bool = True
-) -> Tuple[str, str]:
+    normalize_scores: bool = True,
+    rank_constant: int = 60
+) -> Tuple[str, str, str, str]:
     """
-    Search using both agents and return formatted results.
+    Search using all three agents (Visual, Text, Hybrid RRF) and return formatted results.
 
     Args:
         query: Search query text
         num_results: Number of results to return
         visual_threshold: Minimum normalized score for visual results (0=no filter)
         normalize_scores: Whether to normalize visual scores
+        rank_constant: RRF rank constant k
 
     Returns:
-        Tuple of (visual_html, text_html)
+        Tuple of (visual_html, text_html, hybrid_html, devtools_query)
     """
     if not query.strip():
         empty_msg = "<div style='text-align: center; padding: 40px; color: #999;'>Enter a query to search</div>"
-        return empty_msg, empty_msg
+        return empty_msg, empty_msg, empty_msg, ""
 
     # Check environment first
     is_valid, error_msg = validate_environment_for_action("검색")
     if not is_valid:
         error_html = f"<div style='padding: 20px; color: #721c24; background: #f8d7da; border-radius: 8px;'>{error_msg.replace(chr(10), '<br>')}</div>"
-        return error_html, error_html
+        return error_html, error_html, error_html, ""
 
     try:
         manager = get_search_manager()
@@ -482,11 +497,12 @@ def search_agents(
         # Convert threshold: 0.0 means no filtering
         threshold = visual_threshold if visual_threshold > 0 else None
 
-        results = manager.search_both(
+        results = manager.search_all(
             query,
             size=num_results,
             normalize_visual=normalize_scores,
-            visual_threshold=threshold
+            visual_threshold=threshold,
+            rank_constant=rank_constant
         )
 
         visual_html = format_results_html(
@@ -501,7 +517,15 @@ def search_agents(
             results["text_agent"]["latency_ms"]
         )
 
-        return visual_html, text_html
+        hybrid_html = format_results_html(
+            results["hybrid_agent"]["results"],
+            "hybrid",
+            results["hybrid_agent"]["latency_ms"]
+        )
+
+        devtools_query = results["hybrid_agent"].get("devtools_query", "")
+
+        return visual_html, text_html, hybrid_html, devtools_query
 
     except Exception as e:
         error_html = f"""
@@ -509,7 +533,7 @@ def search_agents(
             <strong>Error:</strong> {str(e)}
         </div>
         """
-        return error_html, error_html
+        return error_html, error_html, error_html, ""
 
 
 def ingest_files(files: List[str], pool_factor: int = 3, progress=gr.Progress()) -> str:
@@ -564,6 +588,7 @@ def get_index_stats() -> str:
         client = ElasticClient()
         visual_count = client.get_index_count(ElasticClient.VISUAL_INDEX)
         text_count = client.get_index_count(ElasticClient.TEXT_INDEX)
+        unified_count = client.get_index_count(ElasticClient.UNIFIED_INDEX)
 
         return f"""
 ### Index Statistics
@@ -572,6 +597,7 @@ def get_index_stats() -> str:
 |-------|-----------|
 | Visual (rank_vectors) | {visual_count} |
 | Text (BM25) | {text_count} |
+| Unified (RRF Hybrid) | {unified_count} |
         """
     except Exception as e:
         return f"Error getting stats: {e}"
@@ -589,13 +615,14 @@ def clear_indices() -> str:
 
 # ========== Settings Functions ==========
 
-def load_current_settings() -> Tuple[str, str, str, str]:
+def load_current_settings() -> Tuple[str, str, str, str, str]:
     """Load current settings for UI display"""
     config = get_config()
     return (
         config.elastic_url or "",
         config.elastic_api_key or "",
         config.jina_api_key or "",
+        config.anthropic_api_key or "",
         config.hf_token or ""
     )
 
@@ -604,6 +631,7 @@ def save_settings(
     elastic_url: str,
     elastic_api_key: str,
     jina_api_key: str,
+    anthropic_api_key: str,
     hf_token: str
 ) -> str:
     """Save settings to config.json and reinitialize clients"""
@@ -614,6 +642,7 @@ def save_settings(
     config.set("elastic_url", elastic_url.strip())
     config.set("elastic_api_key", elastic_api_key.strip())
     config.set("jina_api_key", jina_api_key.strip())
+    config.set("anthropic_api_key", anthropic_api_key.strip())
     config.set("hf_token", hf_token.strip())
 
     if config.save():
@@ -635,6 +664,7 @@ def save_settings(
 **현재 설정:**
 - Elasticsearch: {'✅ 설정됨' if elastic_url and elastic_api_key else '❌ 미설정'}
 - Jina V4: {jina_mode}
+- Anthropic API: {'✅ 설정됨 (Agent Arena 사용 가능)' if anthropic_api_key.strip() else '⚪ 미설정 (Agent Arena 비활성)'}
 - HuggingFace: {'✅ 설정됨' if hf_token else '⚪ 미설정 (선택사항)'}
 
 ✅ **재시작 없이 바로 사용 가능합니다!**"""
@@ -727,7 +757,9 @@ def check_vidore_loaded() -> Tuple[bool, int]:
     try:
         client = ElasticClient()
         # Check for documents with vidore prefix in doc_id
-        result = client.es.count(
+        if not client.client:
+            return False, 0
+        result = client.client.count(
             index=ElasticClient.VISUAL_INDEX,
             query={"prefix": {"doc_id": "vidore_"}}
         )
@@ -988,6 +1020,150 @@ Search Battle 탭에서 위 쿼리로 검색해보세요!"""
 
 # ========== Gradio UI ==========
 
+# ========== Agentic Search Functions ==========
+
+def format_thought_log_html(thought_log, agent_type: str) -> str:
+    """Format agent thought log as HTML timeline."""
+    if not thought_log:
+        return "<div style='text-align: center; color: #999; padding: 20px;'>No thought log</div>"
+
+    color_map = {"visual": "#4CAF50", "text": "#2196F3", "hybrid": "#9C27B0"}
+    agent_color = color_map.get(agent_type, "#666")
+
+    html = f"""
+    <div style="border: 2px solid {agent_color}; border-radius: 12px; overflow: hidden;">
+        <div style="background: {agent_color}; color: white; padding: 10px; text-align: center;">
+            <strong>{'🔍 Visual Agent' if agent_type == 'visual' else '📝 Text Agent' if agent_type == 'text' else '⚡ Hybrid Agent'} — Thought Log</strong>
+        </div>
+        <div style="padding: 12px; background: #fafafa;">
+    """
+
+    icon_map = {
+        "thinking": "🧠",
+        "tool_call": "🔧",
+        "tool_result": "📊",
+        "answer": "💬",
+        "error": "❌"
+    }
+
+    for i, step in enumerate(thought_log):
+        icon = icon_map.get(step.step_type, "•")
+        bg = "#fff" if i % 2 == 0 else "#f8f8f8"
+
+        content = step.content
+        if len(content) > 500:
+            content = content[:500] + "..."
+        # Escape HTML
+        content = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        extra = ""
+        if step.step_type == "tool_call" and step.tool_input:
+            query = step.tool_input.get("query", "")
+            extra = f'<div style="font-size: 11px; color: #666; margin-top: 4px;">Query: "{query}"</div>'
+        elif step.step_type == "tool_result" and step.tool_result:
+            count = step.tool_result.get("count", 0)
+            extra = f'<div style="font-size: 11px; color: #666; margin-top: 4px;">Found {count} results</div>'
+
+        html += f"""
+        <div style="padding: 10px; background: {bg}; border-left: 3px solid {agent_color}; margin-bottom: 6px; border-radius: 4px;">
+            <div style="font-size: 11px; color: #888; margin-bottom: 4px;">{icon} {step.step_type.upper()}</div>
+            <div style="font-size: 13px; color: #333; white-space: pre-wrap;">{content}</div>
+            {extra}
+        </div>
+        """
+
+    html += "</div></div>"
+    return html
+
+
+def format_agent_answer_html(result, agent_type: str) -> str:
+    """Format agent's final answer with stats."""
+    if not result:
+        return ""
+
+    color_map = {"visual": "#4CAF50", "text": "#2196F3", "hybrid": "#9C27B0"}
+    agent_color = color_map.get(agent_type, "#666")
+
+    answer = result.answer.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    return f"""
+    <div style="border: 2px solid {agent_color}; border-radius: 12px; overflow: hidden; margin-top: 12px;">
+        <div style="background: linear-gradient(135deg, {agent_color}, {agent_color}dd); color: white; padding: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <strong>Final Answer</strong>
+                <span style="font-size: 11px; opacity: 0.9;">
+                    ⚡ {result.total_time_ms:.0f}ms | 🔢 {result.tokens_used} tokens | 📊 {len(result.search_results)} results
+                </span>
+            </div>
+        </div>
+        <div style="padding: 16px; background: white; font-size: 14px; line-height: 1.6; white-space: pre-wrap;">
+            {answer}
+        </div>
+    </div>
+    """
+
+
+def run_agent_battle(query: str, run_visual: bool, run_text: bool, run_hybrid: bool):
+    """Run selected agents and return thought logs + answers."""
+    if not query.strip():
+        empty = "<div style='text-align: center; padding: 40px; color: #999;'>Enter a query</div>"
+        return empty, empty, empty, empty, empty, empty
+
+    config = get_config()
+    if not config.anthropic_api_key:
+        error = "<div style='padding: 20px; color: #721c24; background: #f8d7da; border-radius: 8px;'>Anthropic API Key가 설정되지 않았습니다. Settings 탭에서 설정하세요.</div>"
+        return error, "", error, "", error, ""
+
+    # Check environment
+    is_valid, error_msg = validate_environment_for_action("에이전트 검색")
+    if not is_valid:
+        error = f"<div style='padding: 20px; color: #721c24; background: #f8d7da; border-radius: 8px;'>{error_msg}</div>"
+        return error, "", error, "", error, ""
+
+    from backend.agents.search_agent import SearchAgent
+
+    manager = get_search_manager()
+
+    # Define search functions for each agent
+    def visual_search_fn(q, n):
+        results, _ = manager.search_visual(q, n)
+        return results
+
+    def text_search_fn(q, n):
+        results, _ = manager.search_text(q, n)
+        return results
+
+    def hybrid_search_fn(q, n):
+        results, _, _ = manager.search_hybrid(q, n)
+        return results
+
+    results = {}
+    agent_types = []
+    if run_visual:
+        agent_types.append("visual")
+    if run_text:
+        agent_types.append("text")
+    if run_hybrid:
+        agent_types.append("hybrid")
+
+    for atype in agent_types:
+        search_fn = {"visual": visual_search_fn, "text": text_search_fn, "hybrid": hybrid_search_fn}[atype]
+        agent = SearchAgent(atype, config.anthropic_api_key, search_fn)
+        results[atype] = agent.run_sync(query)
+
+    # Format outputs (thought_log, answer) for each agent
+    outputs = []
+    for atype in ["visual", "text", "hybrid"]:
+        if atype in results:
+            outputs.append(format_thought_log_html(results[atype].thought_log, atype))
+            outputs.append(format_agent_answer_html(results[atype], atype))
+        else:
+            outputs.append("<div style='text-align: center; padding: 40px; color: #ccc;'>⏭️ Skipped</div>")
+            outputs.append("")
+
+    return tuple(outputs)
+
+
 CUSTOM_CSS = """
 .result-container { min-height: 400px; }
 .header-text { text-align: center; margin-bottom: 20px; }
@@ -1002,9 +1178,9 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
         """
         # 🔍 PolySight: Agent Battle
 
-        **Visual Agent** (Jina V4 Multi-vector + MaxSim) **vs** **Text Agent** (Docling OCR + BM25)
+        **Visual Agent** (MaxSim) **vs** **Text Agent** (BM25) **vs** **Hybrid Agent** (RRF)
 
-        Compare Late Interaction visual search against traditional OCR-based text search.
+        Compare Late Interaction visual search, OCR-based text search, and Reciprocal Rank Fusion hybrid.
         """,
         elem_classes=["header-text"]
     )
@@ -1053,6 +1229,14 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
                         value=True,
                         info="쿼리 길이와 무관하게 0-1 범위로 정규화"
                     )
+                    rank_constant = gr.Slider(
+                        minimum=1,
+                        maximum=200,
+                        value=60,
+                        step=1,
+                        label="RRF Rank Constant (k)",
+                        info="높을수록 순위 차이 완화 (60=기본, 1=상위 결과 편중)"
+                    )
 
             # Sample query buttons container (shows default queries if documents exist)
             sample_queries_html = gr.HTML(
@@ -1070,17 +1254,32 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
                     label="Text Agent Results",
                     elem_classes=["result-container"]
                 )
+                hybrid_results = gr.HTML(
+                    label="Hybrid Agent Results",
+                    elem_classes=["result-container"]
+                )
+
+            # DevTools Query (for demo copy/paste)
+            with gr.Accordion("🔧 DevTools Query (ES RRF)", open=False):
+                devtools_query_box = gr.Code(
+                    label="Elasticsearch RRF Query (DevTools에서 복사하여 실행)",
+                    language="json",
+                    interactive=False
+                )
 
             # Search event handlers
+            search_inputs = [query_input, num_results, visual_threshold, normalize_scores, rank_constant]
+            search_outputs = [visual_results, text_results, hybrid_results, devtools_query_box]
+
             search_btn.click(
                 fn=search_agents,
-                inputs=[query_input, num_results, visual_threshold, normalize_scores],
-                outputs=[visual_results, text_results]
+                inputs=search_inputs,
+                outputs=search_outputs
             )
             query_input.submit(
                 fn=search_agents,
-                inputs=[query_input, num_results, visual_threshold, normalize_scores],
-                outputs=[visual_results, text_results]
+                inputs=search_inputs,
+                outputs=search_outputs
             )
 
         # Tab 2: Ingest Documents
@@ -1089,9 +1288,11 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
                 """
                 ### Upload Documents
 
-                Upload PDF files or images to index them through both pipelines:
-                - **Visual Pipeline**: Image → Jina V4 Multi-vector → Token Pooling → Elastic (rank_vectors)
-                - **Text Pipeline**: Image → Docling OCR → Text → Elastic (BM25)
+                Upload documents to index them through both pipelines:
+                - **Visual Pipeline**: Document → Page Images → Jina V4 Multi-vector → Elastic (rank_vectors)
+                - **Text Pipeline**: PDF/Image → OCR | Office/Text → Direct Extract → Elastic (BM25)
+
+                Supported: PDF, Images, **DOCX, PPTX, XLSX**, TXT, MD, CSV, JSON, HTML
                 """
             )
 
@@ -1166,7 +1367,12 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
             with gr.Row():
                 file_upload = gr.File(
                     label="Upload Files",
-                    file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff"],
+                    file_types=[
+                        ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp", ".gif",
+                        ".docx", ".pptx", ".xlsx",
+                        ".txt", ".md", ".csv", ".tsv", ".json",
+                        ".html", ".htm", ".xml", ".yaml", ".yml",
+                    ],
                     file_count="multiple",
                     scale=2
                 )
@@ -1243,6 +1449,14 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
 
             gr.Markdown("---")
 
+            # Anthropic Settings (for Agent Arena)
+            gr.Markdown("### 🤖 Anthropic API 설정 (Agent Arena용)")
+            anthropic_api_key_input = gr.Textbox(
+                label="Anthropic API Key",
+                placeholder="sk-ant-xxxxxxxxxxxxxxxx",
+                type="password"
+            )
+
             # HuggingFace Settings
             gr.Markdown("### 🤗 HuggingFace 설정 (선택)")
             hf_token_input = gr.Textbox(
@@ -1262,13 +1476,13 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
 
             save_btn.click(
                 fn=save_settings,
-                inputs=[elastic_url_input, elastic_api_key_input, jina_api_key_input, hf_token_input],
+                inputs=[elastic_url_input, elastic_api_key_input, jina_api_key_input, anthropic_api_key_input, hf_token_input],
                 outputs=[save_output]
             )
 
             reload_btn.click(
                 fn=load_current_settings,
-                outputs=[elastic_url_input, elastic_api_key_input, jina_api_key_input, hf_token_input]
+                outputs=[elastic_url_input, elastic_api_key_input, jina_api_key_input, anthropic_api_key_input, hf_token_input]
             )
 
             gr.Markdown("---")
@@ -1299,7 +1513,65 @@ with gr.Blocks(title="PolySight - Agent Battle") as app:
             # Load current settings on page load
             app.load(
                 fn=load_current_settings,
-                outputs=[elastic_url_input, elastic_api_key_input, jina_api_key_input, hf_token_input]
+                outputs=[elastic_url_input, elastic_api_key_input, jina_api_key_input, anthropic_api_key_input, hf_token_input]
+            )
+
+        # Tab 4: Agent Arena (Agentic Search)
+        with gr.TabItem("🤖 Agent Arena", id="arena"):
+            gr.Markdown(
+                """
+                ### Agent Battle Arena
+
+                LLM-powered agents that **reason about your query** before searching.
+                Each agent has access to different search tools and explains its strategy.
+
+                Requires **Anthropic API Key** (set in Settings).
+                """
+            )
+
+            with gr.Row():
+                arena_query = gr.Textbox(
+                    label="Query",
+                    placeholder="Ask a question about your indexed documents...",
+                    scale=4
+                )
+                arena_btn = gr.Button("🚀 Battle!", variant="primary", scale=1)
+
+            with gr.Row():
+                arena_visual_check = gr.Checkbox(label="🔍 Visual Agent", value=True)
+                arena_text_check = gr.Checkbox(label="📝 Text Agent", value=True)
+                arena_hybrid_check = gr.Checkbox(label="⚡ Hybrid Agent", value=True)
+
+            gr.Markdown("---")
+
+            with gr.Row(equal_height=True):
+                with gr.Column():
+                    visual_thought_log = gr.HTML(label="Visual Agent Thought Log")
+                    visual_answer = gr.HTML(label="Visual Agent Answer")
+                with gr.Column():
+                    text_thought_log = gr.HTML(label="Text Agent Thought Log")
+                    text_answer = gr.HTML(label="Text Agent Answer")
+                with gr.Column():
+                    hybrid_thought_log = gr.HTML(label="Hybrid Agent Thought Log")
+                    hybrid_answer = gr.HTML(label="Hybrid Agent Answer")
+
+            arena_btn.click(
+                fn=run_agent_battle,
+                inputs=[arena_query, arena_visual_check, arena_text_check, arena_hybrid_check],
+                outputs=[
+                    visual_thought_log, visual_answer,
+                    text_thought_log, text_answer,
+                    hybrid_thought_log, hybrid_answer
+                ]
+            )
+            arena_query.submit(
+                fn=run_agent_battle,
+                inputs=[arena_query, arena_visual_check, arena_text_check, arena_hybrid_check],
+                outputs=[
+                    visual_thought_log, visual_answer,
+                    text_thought_log, text_answer,
+                    hybrid_thought_log, hybrid_answer
+                ]
             )
 
     # Footer

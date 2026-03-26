@@ -50,5 +50,9 @@ hf_cache/
 .clinerules
 .roorules
 
+# Auto memory (Claude)
+memory/
+.auto-memory/
+
 # Deployment Scripts
 deploy.py
